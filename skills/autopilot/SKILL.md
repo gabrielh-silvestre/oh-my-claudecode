@@ -113,6 +113,13 @@ V1 does not support `stageModels`, model routing, provider or role selection; in
 6. **Phase 5 - Cleanup**: Delete all state files on successful completion
    - Remove `.omc/state/autopilot-state.json`, `ralph-state.json`, `ultrawork-state.json`, `ultraqa-state.json`
    - Run `/oh-my-claudecode:cancel` for clean exit
+
+   **hexlog (fork `omc-hexlog`)**: if `.hexlog/flow.md` exists at the repo root, invoke `Skill("hexlog-flow")` at these points; skip silently when the file is absent. Target: the ralplan plan or deep-interview spec basename when one was used; otherwise `hex:target:autopilot-{task-slug}`. Pass the same target to ralph in Phase 2.
+   - Phase 1 done (phase `planejamento`): verdict `plan-review` = Critic result, then verdict `execution-approval` = `approve` (evidence: "autopilot invoked by user, no separate approval step").
+   - Each Phase 3 cycle (phase `execucao`): verdict `qa-cycle` = `pass` | `fail` (supersedes the previous cycle).
+   - Phase 4 done (phase `execucao`): verdict `completion-verified` = `approve` only when all three reviewers approve, else `reject` (evidence: who rejected); supersedes ralph's verdict.
+   - Phase 5, before `/oh-my-claudecode:cancel`: evaluate the phase gate `completion-verified`.
+   - Escalation stop: milestone `escalated`; user cancel: milestone `cancelled`.
 </Steps>
 
 <Tool_Usage>

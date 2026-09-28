@@ -16,6 +16,7 @@ Turn vague “it should work” claims into concrete evidence.
 3. If coverage is missing, run the narrowest direct verification commands available.
 4. If direct automation is not enough, describe the manual validation steps and gather concrete observable evidence.
 5. Report only what was actually verified.
+6. **hexlog (fork `omc-hexlog`)**: if `.hexlog/flow.md` exists at the repo root, invoke `Skill("hexlog-flow")` for phase `verificacao`, target: the plan/spec basename of the change when known, otherwise `hex:target:verify-{behavior-slug}`. Register verdict `verified` = `pass` | `fail` | `inconclusive`, or `not-verifiable` with the reason as evidence (evidence: commands/tests run), then evaluate the phase gate `verified`. Skip silently when the file is absent.
 
 ## Verification order
 1. Existing tests

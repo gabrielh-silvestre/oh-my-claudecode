@@ -281,6 +281,7 @@ When ambiguity ≤ the resolved threshold for this run, generate the spec in **s
 - Save to `.omc/specs/deep-dive-{slug}.md`
 - Persist `spec_path` in state: `state_write` with `state.spec_path = ".omc/specs/deep-dive-{slug}.md"`
 - Update `current_phase: "spec-complete"`
+- **hexlog (fork `omc-hexlog`)**: if `.hexlog/flow.md` exists at the repo root, invoke `Skill("hexlog-flow")` for phase `descoberta`, target `hex:target:deep-dive-{slug}`: register milestone `spec-written`, then verdict `spec-crystallized` = `pass` (or `fail` on early exit / hard cap above threshold; evidence: final ambiguity vs threshold), then evaluate the phase gate `spec-crystallized`. Skip silently when the file is absent.
 
 ## Phase 5: Execution Bridge
 
@@ -343,6 +344,8 @@ If the guidance gate does not apply, or the pre-flight passes, present execution
    - Action: Return to Phase 4 interview loop.
 
 **IMPORTANT:** On execution selection, **MUST** invoke the chosen skill via `Skill()` with explicit `spec_path`. Do NOT implement directly. The deep-dive skill is a requirements pipeline, not an execution agent.
+
+**hexlog (fork `omc-hexlog`)**: if `.hexlog/flow.md` exists, before invoking the chosen skill invoke `Skill("hexlog-flow")` for phase `descoberta`, same target, to register verdict `execution-approval`: `approve` for options 1-4 (evidence: chosen route), `request-changes` for option 5. For option 1, once consensus produces the plan and before invoking autopilot, also register verdict `execution-approval` = `approve` in phase `planejamento` on the plan target (evidence: "approved upfront via deep-dive option 1"), since this route has no separate approval step.
 
 ### The 3-Stage Pipeline (Recommended Path)
 

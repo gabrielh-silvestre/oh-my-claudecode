@@ -64,6 +64,13 @@ The consensus workflow:
 7. *(--interactive only)* User chooses: Approve (team or ralph), Request changes, or Reject
 8. *(--interactive only)* On approval: invoke `Skill("oh-my-claudecode:team")` for parallel team execution (recommended) or `Skill("oh-my-claudecode:ralph")` for sequential execution -- never implement directly
 
+**hexlog (fork `omc-hexlog`)**: if `.hexlog/flow.md` exists at the repo root, invoke `Skill("hexlog-flow")` for phase `planejamento`, target `hex:target:{plan-file-basename}` (no `.md`), at these steps; skip silently when the file is absent:
+- Step 1 done: milestone `plan-drafted`.
+- Step 4 done: verdict `plan-review` = `approve` | `iterate` | `reject` (Critic verdict; each iteration supersedes the previous one).
+- Step 5f: milestone `escalated`.
+- Step 6/7 outcome: verdict `execution-approval` = `approve` (evidence: team or ralph) | `pending` (non-interactive or compact) | `request-changes` | `reject`.
+- Step 8, before invoking team/ralph: evaluate the phase gate `execution-approved`.
+
 > **Important:** Steps 3 and 4 MUST run sequentially. Do NOT issue both agent Task calls in the same parallel batch. Always await the Architect result before issuing the Critic Task. Both reviews consume the same fixed plan snapshot; no Architect output passes to Critic; results combine only during Planner synthesis after both reviews complete.
 
 Follow the Plan skill's full documentation for consensus mode details.

@@ -131,11 +131,19 @@ Without cleanup, the stop hook blocks all subsequent stops with `[RALPLAN - CONS
    - **Approve execution via ralph**: **MUST** invoke `Skill("oh-my-claudecode:ralph")` with the approved plan path from `.omc/plans/` as context. Do NOT implement directly. Do NOT edit source code files in the planning agent. The ralph skill handles execution via ultrawork parallel agents.
    - **Compact then return for execution approval**: First invoke `Skill("compact")` to compress the context window (reduces token usage accumulated during planning), then return with the saved pending-approval plan path and require a fresh explicit execution approval before any ralph/team launch. This path is recommended when the context window is 50%+ full after the planning session.
 
+**hexlog (fork `omc-hexlog`)**: if `.hexlog/flow.md` exists at the repo root, invoke `Skill("hexlog-flow")` for phase `planejamento`, target `hex:target:{plan-file-basename}` (no `.md`), at these steps; skip silently when the file is absent:
+- Step 1 done: milestone `plan-drafted`.
+- Step 4 done: verdict `plan-review` = `approve` | `iterate` | `reject` (Critic verdict; each iteration supersedes the previous one).
+- Step 5f (max iterations without approval): milestone `escalated`.
+- Step 7/8 outcome: verdict `execution-approval` = `approve` (team/ralph; evidence: chosen route) | `pending` (non-interactive or compact) | `request-changes` | `reject`.
+- Step 9, before invoking team/ralph: evaluate the phase gate `execution-approved`.
+
 ### Review Mode (`--review`)
 
 1. Read plan file from `.omc/plans/`
 2. Evaluate via Critic using `Task(subagent_type="oh-my-claudecode:critic", ...)`
 3. Return verdict: APPROVED, REVISE (with specific feedback), or REJECT (replanning required)
+4. **hexlog (fork `omc-hexlog`)**: if `.hexlog/flow.md` exists, invoke `Skill("hexlog-flow")` for phase `planejamento` on the plan target to register verdict `plan-review` = `approve` | `iterate` (REVISE) | `reject`.
 
 ### Plan Output Format
 

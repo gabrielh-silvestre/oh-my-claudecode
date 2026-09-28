@@ -397,6 +397,7 @@ When ambiguity ≤ threshold (or hard cap / early exit):
    - Always use this exact final spec path. Do not write temporary working files to the repo root or other ad hoc paths; repos may allowlist `.omc/` for planning artifacts while protecting product branches.
    - For ephemeral artifacts during interview rounds (for example scoring intermediate results, prompt-safe summaries, question queues, or resume metadata), use `.omc/state/` or in-memory state via `state_write`.
    - Persist the final `spec_path` in state when available so downstream skills and resumed sessions can pass the artifact path explicitly.
+3. **hexlog (fork `omc-hexlog`)**: if `.hexlog/flow.md` exists at the repo root, invoke `Skill("hexlog-flow")` for phase `descoberta`, target `hex:target:deep-interview-{slug}`: register milestone `spec-written`, then verdict `spec-crystallized` = `pass` when Status is `PASSED` or `fail` when `BELOW_THRESHOLD_EARLY_EXIT` (evidence: final ambiguity vs threshold), then evaluate the phase gate `spec-crystallized`. Skip silently when the file is absent.
 
 Spec structure:
 
@@ -520,6 +521,8 @@ After the spec is written, mark it `pending approval` and present execution opti
    - Action: Return to Phase 2 interview loop.
 
 **IMPORTANT:** On explicit execution selection, **MUST** invoke the chosen skill via `Skill()`. Do NOT implement directly. The deep-interview agent is a requirements agent, not an execution agent. If oversized initial context was summarized, pass the spec and prompt-safe summary forward, not the raw oversized source material. Without explicit execution selection, stop with the spec marked `pending approval`.
+
+**hexlog (fork `omc-hexlog`)**: if `.hexlog/flow.md` exists, before invoking the chosen skill invoke `Skill("hexlog-flow")` for phase `descoberta`, same target, to register verdict `execution-approval`: `approve` for options 1-4 (evidence: chosen route), `request-changes` for option 5, `pending` when the user picks none.
 
 ### Approval-Gated Refinement Path (Recommended)
 

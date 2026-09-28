@@ -150,6 +150,13 @@ Continue `team-exec -> team-verify -> team-fix` until:
 
 `team-fix` is bounded by max attempts. If fix attempts exceed the configured limit, transition to terminal `failed` (no infinite loop).
 
+**hexlog (fork `omc-hexlog`)**: if `.hexlog/flow.md` exists at the repo root, invoke `Skill("hexlog-flow")` for phase `execucao` at these points; skip silently when the file is absent. Target: the plan/spec basename passed by the caller when one exists; otherwise `hex:target:{team_name}`.
+- Each stage transition (with its handoff doc): milestone `handoff` (evidence: `<from> → <to>`).
+- `team-verify` exit: verdict `team-verify` = `pass` | `fail` (supersedes the previous pass).
+- Standalone team (not linked to ralph), on `team-verify` pass: verdict `completion-verified` = `approve`. Linked to ralph: ralph registers it after architect review.
+- Fix limit exceeded (terminal `failed`): milestone `escalated`. Cancel: milestone `cancelled`.
+- Phase 7, before shutdown: evaluate the phase gate `completion-verified`.
+
 ### Stage Handoff Convention
 
 When transitioning between stages, important context — decisions made, alternatives rejected, risks identified — lives only in the lead's conversation history. If the lead's context compacts or agents restart, this knowledge is lost.

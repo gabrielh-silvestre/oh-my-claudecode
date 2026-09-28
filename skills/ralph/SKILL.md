@@ -128,6 +128,12 @@ By default, ralph operates in PRD mode. A scaffold `prd.json` is auto-generated 
 8. **On approval**: After Step 7.6 passes (with Step 7.5 completed, or skipped via `--no-deslop`), run `/oh-my-claudecode:cancel` to cleanly exit and clean up all state files
 
 9. **On rejection**: Fix the issues raised, re-verify with the same reviewer, then loop back to check if the story needs to be marked incomplete
+
+**hexlog (fork `omc-hexlog`)**: if `.hexlog/flow.md` exists at the repo root, invoke `Skill("hexlog-flow")` for phase `execucao` at these steps; skip silently when the file is absent. Target: reuse the one passed by the caller (plan/spec basename from plan, autopilot or team); otherwise `hex:target:ralph-{task-slug}`.
+- Step 7 done: verdict `completion-verified` = `approve` | `reject` (reviewer verdict; a later one supersedes it).
+- Step 7.6 done: verdict `regression-check` = `pass` | `fail`.
+- Step 8, before `/oh-my-claudecode:cancel`: evaluate the phase gate `completion-verified`.
+- User cancel: milestone `cancelled`. Same issue in 3+ iterations: milestone `escalated`.
    </Steps>
 
 <Tool_Usage>
