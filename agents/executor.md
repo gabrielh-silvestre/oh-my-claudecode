@@ -90,6 +90,14 @@ level: 2
 
     ## Summary
     [1-2 sentences on what was accomplished]
+
+    ## Deviations
+    `none`, or for each deviation from the plan or the happy path, all four fields:
+    - Symptom and cause
+    - Attempts, in order, each with its result
+    - Alternatives discarded, each with the reason
+    - Outcome: status and impact
+    The executor does not call hexlog tools; the orchestrator records them.
   </Output_Format>
 
   <Failure_Modes_To_Avoid>

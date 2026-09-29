@@ -89,7 +89,7 @@ By default, ralph operates in PRD mode. A scaffold `prd.json` is auto-generated 
 
 5. **Mark story complete**:
    a. When ALL acceptance criteria are verified, set `passes: true` for this story in the active PRD file
-   b. Record progress in `progress.txt`: what was implemented, files changed, learnings for future iterations
+   b. Record progress in `progress.txt`: what was implemented, files changed, learnings for future iterations. **hexlog (fork `omc-hexlog`)**: if `.hexlog/flow.md` exists, first register one `deviation` per incident of this story (a non-`none` `## Deviations` an executor reported, a retry after a failed check in Step 4, a sub-story discovered in Step 3 as `plan-deviation`; `decidedBy: executor` or `orchestrator`), and end the entry with one `hexlog: <deviation id>` line per deviation, or `hexlog: none`; skip all of this when running inside team (the lead registers). hexlog-audit:RG-4
    c. Add any discovered codebase patterns to `progress.txt`
 
 6. **Check PRD completion**:
@@ -131,9 +131,13 @@ By default, ralph operates in PRD mode. A scaffold `prd.json` is auto-generated 
 
 **hexlog (fork `omc-hexlog`)**: if `.hexlog/flow.md` exists at the repo root, invoke `Skill("hexlog-flow")` for phase `execucao` at these steps; skip silently when the file is absent. Target: reuse the one passed by the caller (plan/spec basename from plan, autopilot or team); otherwise `hex:target:ralph-{task-slug}`.
 - Step 7 done: verdict `completion-verified` = `approve` | `reject` (reviewer verdict; a later one supersedes it).
+- Step 7 reject, at the moment it happens (not at the end): the `reject` verdict above plus a `deviation` `reviewer-reject` (`decidedBy: orchestrator`); the approve after the fix supersedes that reject. hexlog-audit:RG-5
 - Step 7.6 done: verdict `regression-check` = `pass` | `fail`.
+- Step 7.6 fails, once the sequence ends (fixed or terminal): one `deviation` `verification-failure` with `attempts[]` in order; rolling back the deslop changes is `outcome.status: worked-around`. hexlog-audit:RG-6
+- Step 8, before the gate below: `timeline` of the target must show one `deviation` for each non-`none` `## Deviations` an executor reported and for each `hexlog: <id>` line in `progress.txt`. `timeline` is paginated (limit 50, `nextCursor`): page with `since` = `nextCursor` until it is null before treating anything as missing, because a truncated page is not a gap. Register any gap now, saying in `source` that it is late; a broken chain or attachment: stop and tell the user. hexlog-audit:RG-9
 - Step 8, before `/oh-my-claudecode:cancel`: evaluate the phase gate `completion-verified`.
-- User cancel: milestone `cancelled`. Same issue in 3+ iterations: milestone `escalated`.
+- User cancel: milestone `cancelled`. Same issue in 3+ iterations: milestone `escalated`. Register a `deviation` at the same moment with the reason and what was tried (a stop that needs the user: `outcome.status: user-stop`, `decidedBy: user`). hexlog-audit:RG-8
+- General rule: load `references/audit-types.md` of the `hexlog-flow` skill before recording an audit type. A deviation is any departure from the happy path (retry after a failed check, workaround, plan deviation, scope cut, reviewer reject, blocked dependency, escalation, stop that needs the user): one `deviation` per occurrence (symptom, attempts, outcome), recorded when it ends, cause in `trigger`, resolution in `outcome.status`. Only the skill that receives the executor's result records its deviations: ralph, also when autopilot calls it; inside team, ralph records only the architect verification and the team lead records its own decisions. hexlog-audit:RG-10
    </Steps>
 
 <Tool_Usage>

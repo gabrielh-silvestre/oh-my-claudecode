@@ -152,10 +152,14 @@ Continue `team-exec -> team-verify -> team-fix` until:
 
 **hexlog (fork `omc-hexlog`)**: if `.hexlog/flow.md` exists at the repo root, invoke `Skill("hexlog-flow")` for phase `execucao` at these points; skip silently when the file is absent. Target: the plan/spec basename passed by the caller when one exists; otherwise `hex:target:{team_name}`.
 - Each stage transition (with its handoff doc): milestone `handoff` (evidence: `<from> → <to>`).
+- Each stage transition, sweep the lead's decisions since the previous one (failed task retried or skipped, dependency removed, task reassigned, stuck or crashed teammate replaced): one `deviation` per decision, `outcome.decidedBy: lead`, `trigger` `blocked-dependency` or `agent-failure`. hexlog-audit:RG-7
 - `team-verify` exit: verdict `team-verify` = `pass` | `fail` (supersedes the previous pass).
+- `team-verify` fail followed by `team-fix`, once the fix sequence ends (resolved or terminal `failed`): one `deviation` `verification-failure` with `attempts[]` in order. hexlog-audit:RG-6
 - Standalone team (not linked to ralph), on `team-verify` pass: verdict `completion-verified` = `approve`. Linked to ralph: ralph registers it after architect review.
-- Fix limit exceeded (terminal `failed`): milestone `escalated`. Cancel: milestone `cancelled`.
+- Fix limit exceeded (terminal `failed`): milestone `escalated`. Cancel: milestone `cancelled`. Register a `deviation` at the same moment with the reason and what was tried (a stop that needs the user: `outcome.status: user-stop`, `decidedBy: user`); in `team ralph`, also when the fix loop exceeds `max_fix_loops` and Ralph restarts the pipeline (`outcome.status: worked-around`, `decidedBy: lead`). hexlog-audit:RG-8
+- Phase 7, before the gate below: `timeline` of the target must show one `deviation` for each non-`none` `## Deviations` a worker's executor reported and for each lead decision above. `timeline` is paginated (limit 50, `nextCursor`): page with `since` = `nextCursor` until it is null before treating anything as missing, because a truncated page is not a gap. Register any gap now, saying in `source` that it is late; a broken chain or attachment: stop and tell the user. hexlog-audit:RG-9
 - Phase 7, before shutdown: evaluate the phase gate `completion-verified`.
+- General rule: load `references/audit-types.md` of the `hexlog-flow` skill before recording an audit type. A deviation is any departure from the happy path (retry after a failed check, workaround, plan deviation, scope cut, reviewer reject, blocked dependency, escalation, stop that needs the user): one `deviation` per occurrence (symptom, attempts, outcome), recorded when it ends, cause in `trigger`, resolution in `outcome.status`. Only the skill that receives the executor's result records its deviations: the team lead; linked to ralph, ralph records only the architect verification. hexlog-audit:RG-10
 
 ### Stage Handoff Convention
 
