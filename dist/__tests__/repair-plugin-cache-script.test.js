@@ -108,7 +108,7 @@ describe('repair-plugin-cache.mjs', () => {
         expect(result.status).toBe(0);
         expect(result.stdout).toContain('hooks=platform');
         const hooksJson = JSON.parse(readFileSync(join(pluginRoot, 'hooks', 'hooks.json'), 'utf-8'));
-        expect(hooksJson.hooks.SessionEnd[0].hooks[0].command).toBe('sh "$CLAUDE_PLUGIN_ROOT"/scripts/find-node.sh "$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs "$CLAUDE_PLUGIN_ROOT"/scripts/session-end.mjs');
+        expect(hooksJson.hooks.SessionEnd[0].hooks[0].command).toBe('sh "${CLAUDE_PLUGIN_ROOT}"/scripts/find-node.sh "${CLAUDE_PLUGIN_ROOT}"/scripts/run.cjs "${CLAUDE_PLUGIN_ROOT}"/scripts/session-end.mjs');
     });
     it.runIf(process.platform !== 'win32')('repairs every bundled direct-node hook command to find-node on Unix/macOS', () => {
         const root = mkdtempSync(join(tmpdir(), 'omc-repair-unix-bundled-hooks-'));
@@ -130,7 +130,7 @@ describe('repair-plugin-cache.mjs', () => {
             .map(command => ({ event, command }))));
         expect(commands.length).toBeGreaterThan(0);
         for (const { event, command } of commands) {
-            expect(command, event).toMatch(/^sh "\$CLAUDE_PLUGIN_ROOT"\/scripts\/find-node\.sh "\$CLAUDE_PLUGIN_ROOT"\/scripts\/run\.cjs /);
+            expect(command, event).toMatch(/^sh "\$\{CLAUDE_PLUGIN_ROOT\}"\/scripts\/find-node\.sh "\$\{CLAUDE_PLUGIN_ROOT\}"\/scripts\/run\.cjs /);
             expect(command, event).not.toContain('/bin/sh');
         }
     });
@@ -158,14 +158,18 @@ describe('repair-plugin-cache.mjs', () => {
         });
         expect(result.status).toBe(0);
         const hooksJson = JSON.parse(readFileSync(join(pluginRoot, 'hooks', 'hooks.json'), 'utf-8'));
-        expect(hooksJson.hooks.SessionEnd[0].hooks[0].command).toBe('node "$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs "$CLAUDE_PLUGIN_ROOT"/scripts/session-end.mjs');
+        expect(hooksJson.hooks.SessionEnd[0].hooks[0].command).toBe('node "${CLAUDE_PLUGIN_ROOT}"/scripts/run.cjs "${CLAUDE_PLUGIN_ROOT}"/scripts/session-end.mjs');
     });
-    it('setup instructions repair cache references before prompts and avoid direct cache deletion', () => {
+    it('setup instructions delegate cache resolution and retain phase repair without unsafe deletion', () => {
         const setupSkill = readFileSync(join(REPO_ROOT, 'skills', 'omc-setup', 'SKILL.md'), 'utf-8');
         const phase = readFileSync(join(REPO_ROOT, 'skills', 'omc-setup', 'phases', '02-configure.md'), 'utf-8');
-        expect(setupSkill).toContain('Active Plugin Root Resolution');
-        expect(setupSkill).toContain('repair-plugin-cache.mjs');
-        expect(setupSkill.indexOf('repair-plugin-cache.mjs', setupSkill.indexOf('Active Plugin Root Resolution'))).toBeLessThan(setupSkill.indexOf('## Pre-Setup Check'));
+        const setupInvocationIndex = setupSkill.indexOf('## Setup Invocation');
+        const cacheResolverIndex = setupSkill.indexOf('The script is the sole cache resolver.');
+        const preSetupCheckIndex = setupSkill.indexOf('## Pre-Setup Check');
+        expect(setupInvocationIndex).toBeGreaterThan(-1);
+        expect(cacheResolverIndex).toBeGreaterThan(setupInvocationIndex);
+        expect(cacheResolverIndex).toBeLessThan(preSetupCheckIndex);
+        expect(setupSkill).not.toContain('repair-plugin-cache.mjs');
         expect(phase).toContain('Repair Stale Plugin Cache References');
         expect(phase).toContain('repair-plugin-cache.mjs');
         expect(phase).not.toContain('rmSync(p.join(b,x)');

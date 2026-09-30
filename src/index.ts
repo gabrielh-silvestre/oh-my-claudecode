@@ -67,6 +67,17 @@ export {
 } from './features/auto-update.js';
 export * from './shared/index.js';
 
+// Lookout pre-flight danger scanning API.
+export { LookoutError, resolveBriefArg, scanLookout } from './features/lookout/index.js';
+export type {
+  LookoutConfidence,
+  LookoutFinding,
+  LookoutReport,
+  LookoutSeverity,
+  LookoutVerdict,
+  ScanLookoutOptions,
+} from './features/lookout/index.js';
+
 // Hooks module exports
 export * from './hooks/index.js';
 
@@ -278,7 +289,7 @@ export interface OmcSession {
  *
  * // Use with Claude Agent SDK
  * for await (const message of query({
- *   prompt: session.processPrompt("ultrawork refactor the authentication module"),
+ *   prompt: session.processPrompt("analyze the authentication module"),
  *   ...session.queryOptions
  * })) {
  *   console.log(message);

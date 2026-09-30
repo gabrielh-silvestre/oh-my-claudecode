@@ -9,7 +9,7 @@
  * - config: Show or edit configuration
  * - setup: Sync all OMC components (hooks, agents, skills)
  */
-import { Command } from 'commander';
+import { Command, CommanderError } from 'commander';
 import chalk from 'chalk';
 import { join } from 'path';
 import { writeFileSync, existsSync } from 'fs';
@@ -28,15 +28,19 @@ import { sessionFrictionReportCommand } from './commands/session-friction-report
 import { teamCommand } from './commands/team.js';
 import { ralphthonCommand } from './commands/ralphthon.js';
 import { ultragoalCommand, ULTRAGOAL_HELP } from './commands/ultragoal.js';
+import { aliasRetirementCommand, ALIAS_RETIREMENT_HELP } from './commands/alias-retirement.js';
 import { teleportCommand, teleportListCommand, teleportRemoveCommand } from './commands/teleport.js';
 import { getRuntimePackageVersion } from '../lib/version.js';
 import { resolvePluginDirArg } from '../lib/plugin-dir.js';
 import { launchCommand } from './launch.js';
 import { interopCommand } from './interop.js';
 import { askCommand, ASK_USAGE } from './ask.js';
+import { graphCommand } from './graph.js';
+import { checkpointCommand } from './checkpoint.js';
+import { lookoutCommand } from './lookout.js';
 import { warnIfWin32 } from './win32-warning.js';
 import { autoresearchCommand } from './autoresearch.js';
-import { runHudWatchLoop } from './hud-watch.js';
+import { parseHudWatchInterval, runHudWatchLoop } from './hud-watch.js';
 const version = getRuntimePackageVersion();
 /**
  * Apply a --plugin-dir option value: resolve to absolute path, warn if it
@@ -614,7 +618,6 @@ Examples:
         console.log(`  ${chalk.green(name)}`);
     }
     console.log(chalk.blue('\nMagic Keywords:'));
-    console.log(`  Ultrawork: ${chalk.cyan(session.config.magicKeywords?.ultrawork?.join(', ') ?? 'ultrawork, ulw, uw')}`);
     console.log(`  Search:    ${chalk.cyan(session.config.magicKeywords?.search?.join(', ') ?? 'search, find, locate')}`);
     console.log(`  Analyze:   ${chalk.cyan(session.config.magicKeywords?.analyze?.join(', ') ?? 'analyze, investigate, examine')}`);
     console.log(chalk.gray('\n━'.repeat(50)));
@@ -628,7 +631,7 @@ program
     .description('Test how a prompt would be enhanced')
     .addHelpText('after', `
 Examples:
-  $ omc test-prompt "ultrawork fix bugs"    See how magic keywords are detected
+  $ omc test-prompt "analyze this code"     See how magic keywords are detected
   $ omc test-prompt "analyze this code"     Test prompt enhancement`)
     .action(async (prompt) => {
     const session = createOmcSession();
@@ -837,7 +840,7 @@ Examples:
             console.log('  /omc <task>              # Activate OMC orchestration mode');
             console.log('  /omc-default             # Configure for current project');
             console.log('  /omc-default-global      # Configure globally');
-            console.log('  /ultrawork <task>             # Maximum performance mode');
+            console.log('  /team <task>                  # Coordinated parallel execution');
             console.log('  /deepsearch <query>           # Thorough codebase search');
             console.log('  /analyze <target>             # Deep analysis mode');
             console.log('  /plan <description>           # Start planning with Planner');
@@ -1300,12 +1303,11 @@ program
     .command('hud')
     .description('Run the OMC HUD statusline renderer')
     .option('--watch', 'Run in watch mode (continuous polling for tmux pane)')
-    .option('--interval <ms>', 'Poll interval in milliseconds', '1000')
+    .option('--interval <ms>', 'Poll interval in milliseconds', parseHudWatchInterval, 1000)
     .action(async (options) => {
     const { main: hudMain } = await import('../hud/index.js');
     if (options.watch) {
-        const intervalMs = parseInt(options.interval, 10);
-        await runHudWatchLoop({ intervalMs, hudMain });
+        await runHudWatchLoop({ intervalMs: options.interval, hudMain });
     }
     else {
         await hudMain();
@@ -1398,6 +1400,27 @@ program
     await ultragoalCommand(args);
 });
 /**
+ * Alias retirement verifier — Issue #3711
+ * Read-only eligibility check + generated closure inventory. Never deletes files.
+ */
+program
+    .command('alias-retirement')
+    .description('Alias retirement verifier and generated-closure inventory (issue #3711)')
+    .helpOption(false)
+    .allowUnknownOption(true)
+    .allowExcessArguments(true)
+    .argument('[args...]', 'alias-retirement subcommand arguments')
+    .addHelpText('after', `\n${ALIAS_RETIREMENT_HELP}`)
+    .action(async (args) => {
+    await aliasRetirementCommand(args ?? []);
+});
+/**
+ * Graph command - Execute sealed graph descriptors (graph runtime v2)
+ */
+program.addCommand(graphCommand());
+program.addCommand(checkpointCommand());
+program.addCommand(lookoutCommand());
+/**
  * Returns the fully-configured commander program.
  *
  * Exported so tests can drive the real CLI pipeline (e.g.
@@ -1415,6 +1438,21 @@ export function buildProgram() {
 // and child processes inherit VITEST from the parent vitest worker, which
 // would cause the CLI to silently exit with no output.
 if (!process.env.OMC_CLI_SKIP_PARSE) {
-    program.parse();
+    try {
+        program.parse();
+    }
+    catch (error) {
+        // Commands with an exitOverride (e.g. lookout remaps usage errors to 2)
+        // surface parse failures as CommanderError. Commander has already
+        // printed the message; honor the remapped exit code without a stack.
+        // Other commands keep commander's default process.exit behavior, and
+        // non-Commander errors stay fatal.
+        if (error instanceof CommanderError) {
+            process.exitCode = error.exitCode;
+        }
+        else {
+            throw error;
+        }
+    }
 }
 //# sourceMappingURL=index.js.map

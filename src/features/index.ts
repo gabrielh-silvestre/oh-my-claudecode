@@ -322,4 +322,33 @@ export {
   type SessionHistorySearchOptions,
   type SessionHistorySearchReport,
 } from './session-history-search/index.js';
+// Agent Addressability & Discoverability - unnamed agent addressing/listing contract (#3665)
+export {
+  shortId,
+  hasExplicitName,
+  hasDescription,
+  addressFor,
+  listingLabel,
+  notificationReference,
+  resolveAgent,
+  formatAgentList,
+  SHORT_ID_LENGTH,
+  type AgentStatus,
+  type AddressableAgent,
+  type MatchKind,
+  type ResolveResult,
+  type FormatAgentListOptions,
+} from './agent-addressability/index.js';;
+// lookout - pre-flight danger scan for autonomous runs (advisory only)
+export {
+  LookoutError,
+  resolveBriefArg,
+  scanLookout,
+  type LookoutConfidence,
+  type LookoutFinding,
+  type LookoutReport,
+  type LookoutSeverity,
+  type LookoutVerdict,
+  type ScanLookoutOptions,
+} from './lookout/index.js';
 

@@ -11,6 +11,24 @@ import { colors } from '../utils/formatting.js';
 import { getSkillsDir, listBuiltinSkillNames } from '../../features/builtin-skills/skills.js';
 import { inspectUnifiedMcpRegistrySync } from '../../installer/mcp-registry.js';
 import { findWorkspaceRoot, WORKSPACE_MARKER } from '../../lib/worktree-paths.js';
+function hasActiveOmcPluginForDiagnostics() {
+    if (process.env.CLAUDE_PLUGIN_ROOT?.trim())
+        return true;
+    const settingsPath = join(getClaudeConfigDir(), 'settings.json');
+    if (!existsSync(settingsPath))
+        return false;
+    try {
+        const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+        for (const candidate of [settings.enabledPlugins, settings.plugins]) {
+            if (Array.isArray(candidate) && candidate.some((id) => typeof id === 'string' && id.toLowerCase().includes('oh-my-claudecode')))
+                return true;
+            if (candidate && typeof candidate === 'object' && Object.entries(candidate).some(([id, value]) => id.toLowerCase().includes('oh-my-claudecode') && value !== false))
+                return true;
+        }
+    }
+    catch { /* malformed settings are not proof of an active plugin */ }
+    return false;
+}
 /**
  * Collect hook entries from a single settings.json file.
  */
@@ -277,7 +295,7 @@ export function checkEnvFlags() {
     }
     return { disableOmc, skipHooks };
 }
-const SETUP_FALLBACK_SKILL_NAMES = new Set(['omc-reference']);
+const SETUP_FALLBACK_SKILL_NAMES = new Set(['omc-reference', 'wiki']);
 function parseSemverLikeVersion(version) {
     if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
         return null;
@@ -373,13 +391,17 @@ function getSetupFallbackCanonicalSkillPaths(baseName) {
     });
 }
 function isSupportedSetupFallbackSkill(legacySkillsDir, entry, baseName) {
+    if (hasActiveOmcPluginForDiagnostics()) {
+        return false;
+    }
     if (!SETUP_FALLBACK_SKILL_NAMES.has(baseName)) {
         return false;
     }
     // scripts/setup-claude-md.sh intentionally syncs the raw bundled
-    // skills/omc-reference/SKILL.md file into ~/.claude/skills/omc-reference/SKILL.md
+    // skills/wiki/SKILL.md file into ~/.claude/skills/wiki/SKILL.md. Keep the
+    // retired omc-reference fallback for already-installed 4.x upgrades.
     // as a Claude CLI fallback. Suppress only that exact, unmodified sync so real
-    // legacy collisions and user-edited omc-reference copies still surface.
+    // legacy collisions and user-edited fallback copies still surface.
     if (entry.toLowerCase() !== baseName) {
         return false;
     }
@@ -390,6 +412,34 @@ function isSupportedSetupFallbackSkill(legacySkillsDir, entry, baseName) {
     try {
         const installedContent = readFileSync(installedSkillPath, 'utf-8');
         return getSetupFallbackCanonicalSkillPaths(baseName).some(canonicalSkillPath => (existsSync(canonicalSkillPath)
+            && installedContent === readFileSync(canonicalSkillPath, 'utf-8')));
+    }
+    catch {
+        return false;
+    }
+}
+const OMC_MANAGED_SKILL_MARKER = '.omc-managed';
+function isVerifiedStandaloneManagedSkill(legacySkillsDir, entry, baseName) {
+    if (hasActiveOmcPluginForDiagnostics()) {
+        return false;
+    }
+    if (entry.toLowerCase().endsWith('.md')) {
+        return false;
+    }
+    const skillDir = join(legacySkillsDir, entry);
+    const markerPath = join(skillDir, OMC_MANAGED_SKILL_MARKER);
+    const installedSkillPath = join(skillDir, 'SKILL.md');
+    if (!existsSync(markerPath) || !existsSync(installedSkillPath)) {
+        return false;
+    }
+    const canonicalNames = new Set([baseName]);
+    if (baseName.startsWith('omc-')) {
+        canonicalNames.add(baseName.slice('omc-'.length));
+    }
+    const canonicalPaths = Array.from(canonicalNames).flatMap((name) => getSetupFallbackCanonicalSkillPaths(name));
+    try {
+        const installedContent = readFileSync(installedSkillPath, 'utf-8');
+        return canonicalPaths.some((canonicalSkillPath) => (existsSync(canonicalSkillPath)
             && installedContent === readFileSync(canonicalSkillPath, 'utf-8')));
     }
     catch {
@@ -413,6 +463,9 @@ export function checkLegacySkills() {
             // Match .md files or directories whose name collides with a plugin skill
             const baseName = entry.replace(/\.md$/i, '').toLowerCase();
             if (pluginSkillNames.has(baseName)) {
+                if (isVerifiedStandaloneManagedSkill(legacySkillsDir, entry, baseName)) {
+                    continue;
+                }
                 if (isSupportedSetupFallbackSkill(legacySkillsDir, entry, baseName)) {
                     continue;
                 }
@@ -456,7 +509,9 @@ export function checkConfigIssues() {
             'configVersion',
             'taskTool',
             'taskToolConfig',
-            'defaultExecutionMode',
+            // 'defaultExecutionMode' intentionally NOT known: ultrawork and the
+            // generic execution-mode routing were removed in 5.0.0 and no runtime
+            // reads this key. A persisted value is stale and should surface here.
             'bashHistory',
             'agentTiers',
             'setupCompleted',

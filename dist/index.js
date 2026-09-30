@@ -32,6 +32,8 @@ REPO_OWNER, REPO_NAME, GITHUB_API_URL, CLAUDE_CONFIG_DIR, VERSION_FILE,
 // Auto-update functions
 getInstalledVersion, saveVersionMetadata, checkForUpdates, performUpdate, formatUpdateNotification, shouldCheckForUpdates, backgroundUpdateCheck, compareVersions } from './features/auto-update.js';
 export * from './shared/index.js';
+// Lookout pre-flight danger scanning API.
+export { LookoutError, resolveBriefArg, scanLookout } from './features/lookout/index.js';
 // Hooks module exports
 export * from './hooks/index.js';
 // Team recovery and worker checkpoint public clients.
@@ -69,7 +71,7 @@ export { install, isInstalled, getInstallInfo, isClaudeInstalled, CLAUDE_CONFIG_
  *
  * // Use with Claude Agent SDK
  * for await (const message of query({
- *   prompt: session.processPrompt("ultrawork refactor the authentication module"),
+ *   prompt: session.processPrompt("analyze the authentication module"),
  *   ...session.queryOptions
  * })) {
  *   console.log(message);

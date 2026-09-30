@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const REPO_ROOT = join(__dirname, '..', '..');
 const CI_WORKFLOW = readFileSync(join(REPO_ROOT, '.github', 'workflows', 'ci.yml'), 'utf-8');
@@ -14,6 +15,15 @@ const PACKAGE_JSON = JSON.parse(
   readFileSync(join(REPO_ROOT, 'package.json'), 'utf-8'),
 ) as { scripts?: Record<string, string> };
 
+type ReleaseHelpers = {
+  regeneratePackageLock: (runCommand: (command: string, options: { cwd: string; stdio: 'inherit' }) => unknown) => void;
+  syncMetadata: (runCommand: (command: string, options: { cwd: string; stdio: 'inherit' }) => unknown) => void;
+};
+
+async function loadReleaseHelpers(): Promise<ReleaseHelpers> {
+  return await import(pathToFileURL(join(REPO_ROOT, 'scripts', 'release.ts')).href) as ReleaseHelpers;
+}
+
 describe('plugin shipping release guidance', () => {
   it('verifies the committed shipping surface before CI can build it', () => {
     expect(PACKAGE_JSON.scripts?.['plugin:shipping:verify']).toBe(
@@ -25,6 +35,7 @@ describe('plugin shipping release guidance', () => {
   });
 
   it('keeps candidate artifact containment non-authoritative and credential-free', () => {
+    const ciJobs = CI_WORKFLOW.slice(0, CI_WORKFLOW.indexOf('\n  release:'));
     expect(PACKAGE_JSON.scripts?.['plugin:shipping:check-pr']).toBe(
       'node scripts/plugin-shipping-surface.mjs check-pr',
     );
@@ -34,12 +45,12 @@ describe('plugin shipping release guidance', () => {
     expect(CI_WORKFLOW).toContain(
       'node scripts/ci/check-no-committed-build-artifacts.mjs --base "$BASE_SHA" --head "$HEAD_SHA"',
     );
-    expect(CI_WORKFLOW).not.toContain('npm ci --ignore-scripts');
-    expect(CI_WORKFLOW).not.toContain('GH_TOKEN');
-    expect(CI_WORKFLOW).not.toContain('gh api');
-    expect(CI_WORKFLOW).not.toContain('PR_AUTHOR_ASSOCIATION');
-    expect(CI_WORKFLOW).not.toContain('plugin:shipping:check-pr');
-    expect(CI_WORKFLOW).not.toContain('claude-md-coordinator');
+    expect(ciJobs).not.toContain('npm ci --ignore-scripts');
+    expect(ciJobs).not.toContain('GH_TOKEN');
+    expect(ciJobs).not.toContain('gh api');
+    expect(ciJobs).not.toContain('PR_AUTHOR_ASSOCIATION');
+    expect(ciJobs).not.toContain('plugin:shipping:check-pr');
+    expect(ciJobs).not.toContain('claude-md-coordinator');
     expect(CONTRIBUTING).toContain('credential-free, candidate-side classifier');
     expect(CONTRIBUTING).toContain('non-authoritative for every contributor and maintainer');
     expect(CONTRIBUTING).toContain('workflow root **W**');
@@ -67,5 +78,12 @@ describe('plugin shipping release guidance', () => {
     expect(RELEASE_SCRIPT).not.toMatch(/git push origin (?:dev|main)\b/);
     expect(RELEASE_SCRIPT).not.toMatch(/git (?:checkout|switch) main\b/);
     expect(RELEASE_SCRIPT).not.toMatch(/git merge (?:dev|main)\b/);
+  });
+
+  it('fails when required release preparation commands fail', async () => {
+    const { regeneratePackageLock, syncMetadata } = await loadReleaseHelpers();
+    const failing = () => { throw new Error('command failed'); };
+    expect(() => regeneratePackageLock(failing)).toThrow('command failed');
+    expect(() => syncMetadata(failing)).toThrow('command failed');
   });
 });

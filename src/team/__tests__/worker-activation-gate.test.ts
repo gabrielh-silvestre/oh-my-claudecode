@@ -2,13 +2,22 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { runWorkerActivationGate } from '../worker-activation-gate.js';
-import { awaitWorkerLaunchAcknowledgement, prepareWorkerLaunchAttempt } from '../worker-launch-ack.js';
+import {
+  awaitWorkerLaunchAcknowledgement,
+  awaitWorkerLaunchProviderStarted,
+  buildWorkerLaunchBootstrapSpec,
+  prepareWorkerLaunchAttempt,
+  retireAndCleanupCurrentWorkerLaunchAttempt,
+  runWorkerLaunchBootstrap,
+} from '../worker-launch-ack.js';
 import { isProcessAlive } from '../../platform/process-utils.js';
 
 
 let cwd: string;
+const INSTANCE_ID = '11111111-1111-4111-8111-111111111111';
 beforeEach(() => { cwd = mkdtempSync(join(tmpdir(), 'recovery-gate-')); });
 afterEach(() => { rmSync(cwd, { recursive: true, force: true }); });
 
@@ -17,6 +26,7 @@ async function acceptedAttempt(workerName: string, paneId: string, recoveryId: s
     cwd,
     teamName: 'recovery-gate-team',
     workerName,
+    instanceId: INSTANCE_ID,
     paneId,
     provider: 'codex',
     runtimeCliPath: '/runtime-cli.cjs',
@@ -34,6 +44,7 @@ describe('worker recovery activation gate', () => {
       cwd,
       teamName: 'team',
       workerName: 'worker-1',
+      instanceId: INSTANCE_ID,
       paneId: '%1',
       provider: 'codex',
       runtimeCliPath: join(cwd, 'runtime-cli.cjs'),
@@ -60,7 +71,7 @@ describe('worker recovery activation gate', () => {
     const launchAttempt = await acceptedAttempt('worker-1', '%2', 'recovery-a', 2, 'attempt-a');
     const record = { recovery_id: 'recovery-a', worker_name: 'worker-1', replacement_generation: 2,
       pane_attempt_id: 'attempt-a', launch_attempt_id: launchAttempt.attempt_id, launch_nonce: launchAttempt.nonce,
-      written_at: new Date().toISOString() };
+      instance_id: INSTANCE_ID, written_at: new Date().toISOString() };
     writeFileSync(activatePath, JSON.stringify(record));
     writeFileSync(runPath, JSON.stringify(record));
     await expect(runWorkerActivationGate({
@@ -88,6 +99,96 @@ describe('worker recovery activation gate', () => {
     });
   });
 
+  it.runIf(process.platform !== 'win32')('keeps a nested recovery provider in the durable bootstrap group during rollback', async () => {
+    const readyPath = join(cwd, 'nested-bootstrap-ready.json');
+    const activatePath = join(cwd, 'nested-bootstrap-activate.json');
+    const runPath = join(cwd, 'nested-bootstrap-run.json');
+    const gateSpecPath = join(cwd, 'nested-bootstrap-gate.json');
+    const childPidPath = join(cwd, 'nested-bootstrap-child.pid');
+    const launchAttempt = await prepareWorkerLaunchAttempt({
+      cwd,
+      teamName: 'recovery-gate-team',
+      workerName: 'worker-1',
+      instanceId: INSTANCE_ID,
+      paneId: '%nested',
+      provider: 'codex',
+      runtimeCliPath: '/runtime-cli.cjs',
+      context: { kind: 'recovery', recovery_id: 'recovery-nested-bootstrap', replacement_generation: 3, pane_attempt_id: 'attempt-nested-bootstrap' },
+    });
+    const record = {
+      recovery_id: 'recovery-nested-bootstrap', worker_name: 'worker-1', replacement_generation: 3,
+      pane_attempt_id: 'attempt-nested-bootstrap', launch_attempt_id: launchAttempt.attempt_id,
+      launch_nonce: launchAttempt.nonce, instance_id: INSTANCE_ID, written_at: new Date().toISOString(),
+    };
+    const providerScript = [
+      "const fs=require('node:fs')",
+      "const cp=require('node:child_process')",
+      "const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});child.unref()",
+      `fs.writeFileSync(${JSON.stringify(childPidPath)},String(child.pid))`,
+      'setInterval(()=>{},1000)',
+    ].join(';');
+    const gate = {
+      recoveryId: 'recovery-nested-bootstrap', workerName: 'worker-1', replacementGeneration: 3,
+      paneAttemptId: 'attempt-nested-bootstrap', readyPath, activatePath, runPath,
+      launchAttempt, providerArgv: [process.execPath, '-e', providerScript], cwd,
+      timeoutMs: 5_000, pollIntervalMs: 5,
+    };
+    writeFileSync(gateSpecPath, JSON.stringify(gate));
+    const gateModuleUrl = pathToFileURL(join(process.cwd(), 'src/team/worker-activation-gate.ts')).href;
+    const tsxLoader = join(process.cwd(), 'node_modules/tsx/dist/loader.mjs');
+    const gateRunner = [
+      "import { readFileSync } from 'node:fs'",
+      `const { runWorkerActivationGate } = await import(${JSON.stringify(gateModuleUrl)})`,
+      `const result = await runWorkerActivationGate(JSON.parse(readFileSync(${JSON.stringify(gateSpecPath)}, 'utf8')))`,
+      "if (result.outcome !== 'ran') process.exit(1)",
+    ].join(';');
+    const spec = buildWorkerLaunchBootstrapSpec(
+      launchAttempt,
+      [process.execPath, '--import', tsxLoader, '--input-type=module', '-e', gateRunner],
+      cwd,
+      { providerEnv: { OMC_RECOVERY_GATE_SPEC: JSON.stringify(gate) }, releaseAfterSpawn: true },
+    );
+    const bootstrap = runWorkerLaunchBootstrap(spec);
+    let rollbackComplete = false;
+    try {
+      await expect(awaitWorkerLaunchAcknowledgement(launchAttempt, { timeoutMs: 2_000, pollIntervalMs: 5 }))
+        .resolves.toEqual({ ok: true });
+      await expect(awaitWorkerLaunchProviderStarted(launchAttempt, { timeoutMs: 2_000, pollIntervalMs: 5 }))
+        .resolves.toBe(true);
+      await expect.poll(() => existsSync(readyPath), { timeout: 2_000, interval: 5 }).toBe(true);
+      writeFileSync(activatePath, JSON.stringify(record));
+      writeFileSync(runPath, JSON.stringify(record));
+      await expect.poll(() => existsSync(`${runPath}.launched`), { timeout: 2_000, interval: 5 }).toBe(true);
+
+      const started = JSON.parse(readFileSync(launchAttempt.startedPath, 'utf8')) as { process_group_id: number };
+      const launched = JSON.parse(readFileSync(`${runPath}.launched`, 'utf8')) as {
+        provider_pid: number;
+        process_group_id: number;
+      };
+      expect(started.process_group_id).toEqual(expect.any(Number));
+      expect(launched).toMatchObject({
+        provider_pid: expect.any(Number),
+        process_group_id: started.process_group_id,
+      });
+      const childPid = Number(readFileSync(childPidPath, 'utf8'));
+      await expect(retireAndCleanupCurrentWorkerLaunchAttempt(
+        launchAttempt,
+        'nested_bootstrap_rollback',
+        async () => true,
+      )).resolves.toBe(true);
+      rollbackComplete = true;
+      await expect(bootstrap).resolves.toMatchObject({ outcome: 'ran' });
+      await expect.poll(() => isProcessAlive(childPid), { timeout: 2_000, interval: 20 }).toBe(false);
+      await expect.poll(() => isProcessAlive(launched.provider_pid), { timeout: 2_000, interval: 20 }).toBe(false);
+      expect(() => process.kill(-started.process_group_id, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+    } finally {
+      if (!rollbackComplete) {
+        await retireAndCleanupCurrentWorkerLaunchAttempt(launchAttempt, 'nested_bootstrap_rollback_cleanup', async () => true).catch(() => false);
+      }
+      await bootstrap.catch(() => ({ outcome: 'provider_spawn_failed' as const }));
+    }
+  });
+
   it.each([0, 7])('does not publish launched evidence for a provider that exits immediately with code %s', async exitCode => {
     const readyPath = join(cwd, 'early-exit-ready.json');
     const activatePath = join(cwd, 'early-exit-activate.json');
@@ -95,7 +196,7 @@ describe('worker recovery activation gate', () => {
     const launchAttempt = await acceptedAttempt('worker-1', '%9', 'recovery-early-exit', 9, 'attempt-early-exit');
     const record = { recovery_id: 'recovery-early-exit', worker_name: 'worker-1', replacement_generation: 9,
       pane_attempt_id: 'attempt-early-exit', launch_attempt_id: launchAttempt.attempt_id, launch_nonce: launchAttempt.nonce,
-      written_at: new Date().toISOString() };
+      instance_id: INSTANCE_ID, written_at: new Date().toISOString() };
     writeFileSync(activatePath, JSON.stringify(record));
     writeFileSync(runPath, JSON.stringify(record));
 
@@ -115,7 +216,7 @@ describe('worker recovery activation gate', () => {
     const launchAttempt = await acceptedAttempt('worker-1', '%9', 'recovery-early-child', 9, 'attempt-early-child');
     const record = { recovery_id: 'recovery-early-child', worker_name: 'worker-1', replacement_generation: 9,
       pane_attempt_id: 'attempt-early-child', launch_attempt_id: launchAttempt.attempt_id, launch_nonce: launchAttempt.nonce,
-      written_at: new Date().toISOString() };
+      instance_id: INSTANCE_ID, written_at: new Date().toISOString() };
     writeFileSync(activatePath, JSON.stringify(record));
     writeFileSync(runPath, JSON.stringify(record));
     const script = [
@@ -143,7 +244,7 @@ describe('worker recovery activation gate', () => {
     const launchAttempt = await acceptedAttempt('worker-1', '%3', 'recovery-b', 3, 'attempt-b');
     const record = { recovery_id: 'recovery-b', worker_name: 'worker-1', replacement_generation: 3,
       pane_attempt_id: 'attempt-b', launch_attempt_id: launchAttempt.attempt_id, launch_nonce: launchAttempt.nonce,
-      written_at: new Date().toISOString() };
+      instance_id: INSTANCE_ID, written_at: new Date().toISOString() };
     writeFileSync(activatePath, JSON.stringify(record));
     writeFileSync(runPath, JSON.stringify(record));
     await expect(runWorkerActivationGate({
@@ -162,7 +263,7 @@ describe('worker recovery activation gate', () => {
     const launchAttempt = await acceptedAttempt('worker-1', '%10', 'recovery-marker-failure', 10, 'attempt-marker-failure');
     const record = { recovery_id: 'recovery-marker-failure', worker_name: 'worker-1', replacement_generation: 10,
       pane_attempt_id: 'attempt-marker-failure', launch_attempt_id: launchAttempt.attempt_id, launch_nonce: launchAttempt.nonce,
-      written_at: new Date().toISOString() };
+      instance_id: INSTANCE_ID, written_at: new Date().toISOString() };
     writeFileSync(activatePath, JSON.stringify(record));
     writeFileSync(runPath, JSON.stringify(record));
     mkdirSync(`${runPath}.launched`);
@@ -192,7 +293,7 @@ describe('worker recovery activation gate', () => {
     const record = {
       recovery_id: 'recovery-exact', worker_name: 'worker-1', replacement_generation: 8,
       pane_attempt_id: 'attempt-exact', launch_attempt_id: launchAttempt.attempt_id,
-      launch_nonce: launchAttempt.nonce, written_at: new Date().toISOString(),
+      launch_nonce: launchAttempt.nonce, instance_id: INSTANCE_ID, written_at: new Date().toISOString(),
       [field]: replacement,
     };
     writeFileSync(activatePath, JSON.stringify(record));
@@ -217,7 +318,8 @@ describe('worker recovery activation gate', () => {
     const runPath = join(cwd, 'stale-run.json');
     const providerMarker = join(cwd, 'stale-provider-ran');
     const record = { recovery_id: 'recovery-stale', worker_name: 'worker-1', replacement_generation: 4,
-      pane_attempt_id: 'attempt-stale', launch_attempt_id: 'stale-launch', launch_nonce: 'stale-nonce', written_at: new Date().toISOString() };
+      pane_attempt_id: 'attempt-stale', launch_attempt_id: 'stale-launch', launch_nonce: 'stale-nonce',
+      instance_id: INSTANCE_ID, written_at: new Date().toISOString() };
     writeFileSync(activatePath, JSON.stringify(record));
     writeFileSync(runPath, JSON.stringify(record));
     const launchAttempt = await acceptedAttempt('worker-1', '%4', 'recovery-current', 5, 'attempt-current');
@@ -243,7 +345,7 @@ describe('worker recovery activation gate', () => {
     const launchAttempt = await acceptedAttempt('worker-1', '%5', 'recovery-old', 6, 'attempt-old');
     const record = { recovery_id: 'recovery-old', worker_name: 'worker-1', replacement_generation: 6,
       pane_attempt_id: 'attempt-old', launch_attempt_id: launchAttempt.attempt_id, launch_nonce: launchAttempt.nonce,
-      written_at: new Date().toISOString() };
+      instance_id: INSTANCE_ID, written_at: new Date().toISOString() };
     writeFileSync(activatePath, JSON.stringify(record));
 
     const gate = runWorkerActivationGate({
@@ -263,6 +365,7 @@ describe('worker recovery activation gate', () => {
       cwd,
       teamName: launchAttempt.team_name,
       workerName: launchAttempt.worker_name,
+      instanceId: INSTANCE_ID,
       paneId: '%6',
       provider: launchAttempt.provider,
       runtimeCliPath: launchAttempt.runtimeCliPath,

@@ -88,8 +88,10 @@ Smart cancellation that auto-detects active mode.
 
 **Usage:** `/cancel` or just say "cancelomc", "stopomc"
 
-Auto-detects and cancels: autopilot, ralph, ultrawork, ultraqa, pipeline
-Use `--force` or `--all` to clear ALL states.
+Auto-detects and cancels: autopilot, ralph, ultrawork, pipeline, team
+Use `--force` to skip graceful waits in the current session without widening scope.
+Use `--all` to cancel across sessions; combine `--force --all` for forced cancellation across sessions.
+Neither flag bypasses state locks or ownership checks.
 
 ## Verification Module (v3.4)
 
@@ -115,7 +117,6 @@ Standardized state file locations.
 | autopilot | `autopilot-state.json` |
 | ultrawork | `ultrawork-state.json` |
 |  | `-state.json` |
-| ultraqa | `ultraqa-state.json` |
 | pipeline | `pipeline-state.json` |
 
 **Important:** Never store OMC state in `~/.claude/` - that directory is reserved for Claude Code itself.

@@ -47,8 +47,8 @@ export declare const graphAgentNodeSchema: z.ZodObject<{
 }, "strict", z.ZodTypeAny, {
     title: string;
     id: string;
-    instructions: string;
     kind: "agent";
+    instructions: string;
     timeout_ms: number;
     max_attempts: number;
     effect_policy: {
@@ -62,8 +62,8 @@ export declare const graphAgentNodeSchema: z.ZodObject<{
 }, {
     title: string;
     id: string;
-    instructions: string;
     kind: "agent";
+    instructions: string;
     timeout_ms: number;
     max_attempts: number;
     effect_policy: {
@@ -202,8 +202,8 @@ export declare const graphNodeSchema: z.ZodDiscriminatedUnion<"kind", [z.ZodObje
 }, "strict", z.ZodTypeAny, {
     title: string;
     id: string;
-    instructions: string;
     kind: "agent";
+    instructions: string;
     timeout_ms: number;
     max_attempts: number;
     effect_policy: {
@@ -217,8 +217,8 @@ export declare const graphNodeSchema: z.ZodDiscriminatedUnion<"kind", [z.ZodObje
 }, {
     title: string;
     id: string;
-    instructions: string;
     kind: "agent";
+    instructions: string;
     timeout_ms: number;
     max_attempts: number;
     effect_policy: {
@@ -330,13 +330,13 @@ export declare const graphFixedEdgeSchema: z.ZodObject<{
 }, "strict", z.ZodTypeAny, {
     id: string;
     kind: "fixed";
-    from: string;
     to: string;
+    from: string;
 }, {
     id: string;
     kind: "fixed";
-    from: string;
     to: string;
+    from: string;
 }>;
 export declare const graphConditionalEdgeSchema: z.ZodObject<{
     kind: z.ZodLiteral<"conditional">;
@@ -347,14 +347,14 @@ export declare const graphConditionalEdgeSchema: z.ZodObject<{
 }, "strict", z.ZodTypeAny, {
     id: string;
     kind: "conditional";
-    from: string;
     to: string;
+    from: string;
     route: string;
 }, {
     id: string;
     kind: "conditional";
-    from: string;
     to: string;
+    from: string;
     route: string;
 }>;
 export declare const graphFanOutEdgeSchema: z.ZodObject<{
@@ -367,15 +367,15 @@ export declare const graphFanOutEdgeSchema: z.ZodObject<{
 }, "strict", z.ZodTypeAny, {
     id: string;
     kind: "fan_out";
-    from: string;
     to: string;
+    from: string;
     branch_id: string;
     owner_join_id: string;
 }, {
     id: string;
     kind: "fan_out";
-    from: string;
     to: string;
+    from: string;
     branch_id: string;
     owner_join_id: string;
 }>;
@@ -389,15 +389,15 @@ export declare const graphBackEdgeSchema: z.ZodObject<{
 }, "strict", z.ZodTypeAny, {
     id: string;
     kind: "back_edge";
-    from: string;
     to: string;
+    from: string;
     route: string;
     max_traversals: number;
 }, {
     id: string;
     kind: "back_edge";
-    from: string;
     to: string;
+    from: string;
     route: string;
     max_traversals: number;
 }>;
@@ -409,13 +409,13 @@ export declare const graphEdgeSchema: z.ZodDiscriminatedUnion<"kind", [z.ZodObje
 }, "strict", z.ZodTypeAny, {
     id: string;
     kind: "fixed";
-    from: string;
     to: string;
+    from: string;
 }, {
     id: string;
     kind: "fixed";
-    from: string;
     to: string;
+    from: string;
 }>, z.ZodObject<{
     kind: z.ZodLiteral<"conditional">;
     route: z.ZodString;
@@ -425,14 +425,14 @@ export declare const graphEdgeSchema: z.ZodDiscriminatedUnion<"kind", [z.ZodObje
 }, "strict", z.ZodTypeAny, {
     id: string;
     kind: "conditional";
-    from: string;
     to: string;
+    from: string;
     route: string;
 }, {
     id: string;
     kind: "conditional";
-    from: string;
     to: string;
+    from: string;
     route: string;
 }>, z.ZodObject<{
     kind: z.ZodLiteral<"fan_out">;
@@ -444,15 +444,15 @@ export declare const graphEdgeSchema: z.ZodDiscriminatedUnion<"kind", [z.ZodObje
 }, "strict", z.ZodTypeAny, {
     id: string;
     kind: "fan_out";
-    from: string;
     to: string;
+    from: string;
     branch_id: string;
     owner_join_id: string;
 }, {
     id: string;
     kind: "fan_out";
-    from: string;
     to: string;
+    from: string;
     branch_id: string;
     owner_join_id: string;
 }>, z.ZodObject<{
@@ -465,15 +465,15 @@ export declare const graphEdgeSchema: z.ZodDiscriminatedUnion<"kind", [z.ZodObje
 }, "strict", z.ZodTypeAny, {
     id: string;
     kind: "back_edge";
-    from: string;
     to: string;
+    from: string;
     route: string;
     max_traversals: number;
 }, {
     id: string;
     kind: "back_edge";
-    from: string;
     to: string;
+    from: string;
     route: string;
     max_traversals: number;
 }>]>;
@@ -514,8 +514,8 @@ export declare const graphDescriptorSchema: z.ZodObject<{
     }, "strict", z.ZodTypeAny, {
         title: string;
         id: string;
-        instructions: string;
         kind: "agent";
+        instructions: string;
         timeout_ms: number;
         max_attempts: number;
         effect_policy: {
@@ -529,8 +529,8 @@ export declare const graphDescriptorSchema: z.ZodObject<{
     }, {
         title: string;
         id: string;
-        instructions: string;
         kind: "agent";
+        instructions: string;
         timeout_ms: number;
         max_attempts: number;
         effect_policy: {
@@ -642,13 +642,13 @@ export declare const graphDescriptorSchema: z.ZodObject<{
     }, "strict", z.ZodTypeAny, {
         id: string;
         kind: "fixed";
-        from: string;
         to: string;
+        from: string;
     }, {
         id: string;
         kind: "fixed";
-        from: string;
         to: string;
+        from: string;
     }>, z.ZodObject<{
         kind: z.ZodLiteral<"conditional">;
         route: z.ZodString;
@@ -658,14 +658,14 @@ export declare const graphDescriptorSchema: z.ZodObject<{
     }, "strict", z.ZodTypeAny, {
         id: string;
         kind: "conditional";
-        from: string;
         to: string;
+        from: string;
         route: string;
     }, {
         id: string;
         kind: "conditional";
-        from: string;
         to: string;
+        from: string;
         route: string;
     }>, z.ZodObject<{
         kind: z.ZodLiteral<"fan_out">;
@@ -677,15 +677,15 @@ export declare const graphDescriptorSchema: z.ZodObject<{
     }, "strict", z.ZodTypeAny, {
         id: string;
         kind: "fan_out";
-        from: string;
         to: string;
+        from: string;
         branch_id: string;
         owner_join_id: string;
     }, {
         id: string;
         kind: "fan_out";
-        from: string;
         to: string;
+        from: string;
         branch_id: string;
         owner_join_id: string;
     }>, z.ZodObject<{
@@ -698,15 +698,15 @@ export declare const graphDescriptorSchema: z.ZodObject<{
     }, "strict", z.ZodTypeAny, {
         id: string;
         kind: "back_edge";
-        from: string;
         to: string;
+        from: string;
         route: string;
         max_traversals: number;
     }, {
         id: string;
         kind: "back_edge";
-        from: string;
         to: string;
+        from: string;
         route: string;
         max_traversals: number;
     }>]>, "many">;
@@ -715,15 +715,15 @@ export declare const graphDescriptorSchema: z.ZodObject<{
     terminal_verification_node_id: z.ZodString;
     descriptor_hash: z.ZodOptional<z.ZodString>;
 }, "strict", z.ZodTypeAny, {
-    run_id: string;
-    goal: string;
     descriptor_version: 1;
+    run_id: string;
     revision_id: string;
+    goal: string;
     nodes: ({
         title: string;
         id: string;
-        instructions: string;
         kind: "agent";
+        instructions: string;
         timeout_ms: number;
         max_attempts: number;
         effect_policy: {
@@ -764,26 +764,26 @@ export declare const graphDescriptorSchema: z.ZodObject<{
     edges: ({
         id: string;
         kind: "fixed";
-        from: string;
         to: string;
+        from: string;
     } | {
         id: string;
         kind: "conditional";
-        from: string;
         to: string;
+        from: string;
         route: string;
     } | {
         id: string;
         kind: "fan_out";
-        from: string;
         to: string;
+        from: string;
         branch_id: string;
         owner_join_id: string;
     } | {
         id: string;
         kind: "back_edge";
-        from: string;
         to: string;
+        from: string;
         route: string;
         max_traversals: number;
     })[];
@@ -792,15 +792,15 @@ export declare const graphDescriptorSchema: z.ZodObject<{
     terminal_verification_node_id: string;
     descriptor_hash?: string | undefined;
 }, {
-    run_id: string;
-    goal: string;
     descriptor_version: 1;
+    run_id: string;
     revision_id: string;
+    goal: string;
     nodes: ({
         title: string;
         id: string;
-        instructions: string;
         kind: "agent";
+        instructions: string;
         timeout_ms: number;
         max_attempts: number;
         effect_policy: {
@@ -841,26 +841,26 @@ export declare const graphDescriptorSchema: z.ZodObject<{
     edges: ({
         id: string;
         kind: "fixed";
-        from: string;
         to: string;
+        from: string;
     } | {
         id: string;
         kind: "conditional";
-        from: string;
         to: string;
+        from: string;
         route: string;
     } | {
         id: string;
         kind: "fan_out";
-        from: string;
         to: string;
+        from: string;
         branch_id: string;
         owner_join_id: string;
     } | {
         id: string;
         kind: "back_edge";
-        from: string;
         to: string;
+        from: string;
         route: string;
         max_traversals: number;
     })[];
@@ -902,8 +902,8 @@ export declare const graphNodeResultSchema: z.ZodObject<{
     }>, "many">;
     external_idempotency_key: z.ZodOptional<z.ZodString>;
 }, "strict", z.ZodTypeAny, {
-    attempt_id: string;
     outcome: "failed" | "succeeded";
+    attempt_id: string;
     evidence_refs: {
         kind: "file" | "command" | "test" | "url" | "human";
         ref: string;
@@ -913,8 +913,8 @@ export declare const graphNodeResultSchema: z.ZodObject<{
     output_summary?: string | undefined;
     external_idempotency_key?: string | undefined;
 }, {
-    attempt_id: string;
     outcome: "failed" | "succeeded";
+    attempt_id: string;
     evidence_refs: {
         kind: "file" | "command" | "test" | "url" | "human";
         ref: string;

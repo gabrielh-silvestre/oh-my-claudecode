@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
+import { existsSync } from 'fs';
 import { mkdtemp, rm, mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -24,12 +25,13 @@ async function initTeamState(teamName, wd) {
     await mkdir(join(base, 'mailbox'), { recursive: true });
     await mkdir(join(base, 'events'), { recursive: true });
     await writeFile(join(base, 'config.json'), JSON.stringify({
-        team_name: teamName,
+        name: teamName,
         task: 'test',
         agent_type: 'executor',
         worker_count: 1,
         workers: [{ name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] }],
         created_at: new Date().toISOString(),
+        tmux_session: 'test-session:0',
     }));
 }
 describe('teamCommand help output', () => {
@@ -62,11 +64,34 @@ describe('teamCommand help output', () => {
 describe('teamCommand api operations', () => {
     let wd;
     let previousCwd;
+    let previousHome;
+    let previousUserProfile;
+    let previousStateDir;
+    const isolateFixtureHome = (directory) => {
+        previousHome = process.env.HOME;
+        previousUserProfile = process.env.USERPROFILE;
+        previousStateDir = process.env.OMC_STATE_DIR;
+        process.env.HOME = directory;
+        process.env.USERPROFILE = directory;
+        delete process.env.OMC_STATE_DIR;
+    };
     afterEach(async () => {
         if (previousCwd)
             process.chdir(previousCwd);
         if (wd)
             await rm(wd, { recursive: true, force: true }).catch(() => { });
+        if (previousHome === undefined)
+            delete process.env.HOME;
+        else
+            process.env.HOME = previousHome;
+        if (previousUserProfile === undefined)
+            delete process.env.USERPROFILE;
+        else
+            process.env.USERPROFILE = previousUserProfile;
+        if (previousStateDir === undefined)
+            delete process.env.OMC_STATE_DIR;
+        else
+            process.env.OMC_STATE_DIR = previousStateDir;
         process.exitCode = 0;
     });
     it('returns JSON error for unknown operation with --json', async () => {
@@ -82,6 +107,7 @@ describe('teamCommand api operations', () => {
     });
     it('executes send-message with stable JSON envelope', async () => {
         wd = await mkdtemp(join(tmpdir(), 'omc-team-cli-'));
+        isolateFixtureHome(wd);
         previousCwd = process.cwd();
         process.chdir(wd);
         await initTeamState('cli-test', wd);
@@ -105,6 +131,7 @@ describe('teamCommand api operations', () => {
     });
     it('supports claim-safe lifecycle: create -> claim -> transition', async () => {
         wd = await mkdtemp(join(tmpdir(), 'omc-team-lifecycle-'));
+        isolateFixtureHome(wd);
         previousCwd = process.cwd();
         process.chdir(wd);
         await initTeamState('lifecycle', wd);
@@ -178,6 +205,32 @@ describe('teamCommand api operations', () => {
             process.exitCode = 0;
         }
     });
+    it('rejects the legacy runtime before creating native team state', async () => {
+        wd = await mkdtemp(join(tmpdir(), 'omc-team-cli-v1-rejected-'));
+        isolateFixtureHome(wd);
+        previousCwd = process.cwd();
+        process.chdir(wd);
+        const previousRuntimeFlag = process.env.OMC_RUNTIME_V2;
+        const errors = [];
+        const originalError = console.error;
+        try {
+            process.env.OMC_RUNTIME_V2 = '0';
+            console.error = (...args) => errors.push(args.map(String).join(' '));
+            await teamCommand(['1:codex', 'do work']);
+            expect(errors.join('\n')).toContain('team_start_unsafe_runtime_v1');
+            expect(errors.join('\n')).toContain('OMC_RUNTIME_V2=1');
+            expect(existsSync(join(wd, '.omc', 'state', 'team'))).toBe(false);
+            expect(process.exitCode).toBe(1);
+        }
+        finally {
+            console.error = originalError;
+            if (previousRuntimeFlag === undefined)
+                delete process.env.OMC_RUNTIME_V2;
+            else
+                process.env.OMC_RUNTIME_V2 = previousRuntimeFlag;
+            process.exitCode = 0;
+        }
+    });
     it('reports malformed worker specs without dumping generic team usage', async () => {
         const errors = [];
         const originalError = console.error;
@@ -195,6 +248,7 @@ describe('teamCommand api operations', () => {
     });
     it('ignores stale team state without a live tmux session when enforcing leader spawn gate', async () => {
         wd = await mkdtemp(join(tmpdir(), 'omc-team-stale-gate-'));
+        isolateFixtureHome(wd);
         const stale = join(wd, '.omc', 'state', 'team', 'stale-team');
         await mkdir(stale, { recursive: true });
         await writeFile(join(stale, 'config.json'), JSON.stringify({
@@ -204,6 +258,7 @@ describe('teamCommand api operations', () => {
             worker_count: 1,
             workers: [{ name: 'worker-1', index: 1, role: 'claude', assigned_tasks: [] }],
             created_at: new Date().toISOString(),
+            tmux_session: 'stale-session:0',
             next_task_id: 1,
         }, null, 2));
         delete process.env.OMC_TEAM_WORKER;
@@ -212,6 +267,7 @@ describe('teamCommand api operations', () => {
     });
     it('allows nested team spawn only when parent governance enables it', async () => {
         wd = await mkdtemp(join(tmpdir(), 'omc-team-governance-'));
+        isolateFixtureHome(wd);
         previousCwd = process.cwd();
         process.chdir(wd);
         const base = join(wd, '.omc', 'state', 'team', 'demo-team');
@@ -363,8 +419,20 @@ describe('parseTeamArgs comma-separated multi-type specs', () => {
         const parsed = parseTeamArgs(['abcdefghijklmnopqrstuvwxyz abc', 'task body']);
         expect(parsed.teamName.endsWith('-')).toBe(false);
         const slugWd = await mkdtemp(join(tmpdir(), 'omc-team-slug-'));
+        const originalHome = process.env.HOME;
+        const originalUserProfile = process.env.USERPROFILE;
+        process.env.HOME = slugWd;
+        process.env.USERPROFILE = slugWd;
         await mkdir(join(slugWd, '.omc', 'state', 'team', parsed.teamName), { recursive: true });
         expect(resolveAvailableTeamName(parsed.teamName, slugWd)).toBe(`${parsed.teamName.slice(0, 28).replace(/-$/g, '')}-2`);
+        if (originalHome === undefined)
+            delete process.env.HOME;
+        else
+            process.env.HOME = originalHome;
+        if (originalUserProfile === undefined)
+            delete process.env.USERPROFILE;
+        else
+            process.env.USERPROFILE = originalUserProfile;
         await rm(slugWd, { recursive: true, force: true });
     });
     it('treats role-only shorthand as claude workers plus a shared role', () => {
@@ -445,9 +513,22 @@ describe('parseTeamArgs comma-separated multi-type specs', () => {
         ]);
         expect(parsed.task).toBe('compare edits');
     });
-    it('rejects cursor with non-executor explicit roles', () => {
-        expect(() => parseTeamArgs(['1:cursor:architect', 'design auth'])).toThrow(/Cursor workers are executor-style only/);
-        expect(() => parseTeamArgs(['1:cursor:security-reviewer', 'review auth'])).toThrow(/Cursor workers are executor-style only/);
+    it('accepts cursor with non-executor explicit roles (issue #3880)', () => {
+        expect(parseTeamArgs(['1:cursor:architect', 'design auth']).workerSpecs).toEqual([
+            { agentType: 'cursor', role: 'architect' },
+        ]);
+        expect(parseTeamArgs(['1:cursor:security-reviewer', 'review auth']).workerSpecs).toEqual([
+            { agentType: 'cursor', role: 'security-reviewer' },
+        ]);
+    });
+    it('accepts a mixed cursor-reviewer / codex-critic spec (issue #3880)', () => {
+        const parsed = parseTeamArgs(['1:cursor:code-reviewer,1:codex:critic', 'review the change']);
+        expect(parsed.workerCount).toBe(2);
+        expect(parsed.agentTypes).toEqual(['cursor', 'codex']);
+        expect(parsed.workerSpecs).toEqual([
+            { agentType: 'cursor', role: 'code-reviewer' },
+            { agentType: 'codex', role: 'critic' },
+        ]);
     });
     it('parses single-type spec 2:antigravity into uniform agentTypes', () => {
         const parsed = parseTeamArgs(['2:antigravity', 'apply implementation']);

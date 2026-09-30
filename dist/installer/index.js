@@ -7,9 +7,9 @@
  * Cross-platform support via Node.js-based hook scripts (.mjs).
  * Bash hook scripts were removed in v3.9.0.
  */
-import { existsSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, chmodSync, readdirSync, cpSync, unlinkSync, rmSync, realpathSync, statSync, lstatSync } from 'fs';
-import { createHash } from 'crypto';
-import { join, dirname, resolve, isAbsolute, basename } from 'path';
+import { existsSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, chmodSync, readdirSync, cpSync, unlinkSync, rmSync, realpathSync, statSync, lstatSync, renameSync, openSync, closeSync } from 'fs';
+import { createHash, randomUUID } from 'crypto';
+import { join, dirname, resolve, isAbsolute, basename, relative, sep } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
 import { execSync } from 'child_process';
@@ -28,6 +28,7 @@ import { OMC_PLUGIN_ROOT_ENV } from '../lib/env-vars.js';
 import { analyzeLegacyClaudeMd, OMC_END_MARKER, OMC_START_MARKER, parseClaudeMdMarkers, removeClaudeMdRanges } from './claude-md-analysis.js';
 import { executeClaudeMdTransaction } from './claude-md-transaction.js';
 import { HISTORICAL_AGENT_OWNERSHIP } from './historical-agent-ownership.js';
+import entitlementManifest from '../config/builtin-skill-entitlements.json' with { type: 'json' };
 /** Claude Code configuration directory */
 export const CLAUDE_CONFIG_DIR = getClaudeConfigDir();
 export const AGENTS_DIR = join(CLAUDE_CONFIG_DIR, 'agents');
@@ -61,11 +62,7 @@ const CC_NATIVE_COMMANDS = new Set([
     'compact',
     'memory',
 ]);
-const SKININTHEGAMEBROS_ONLY_SKILLS = new Set([
-    'remember',
-    'verify',
-    'debug',
-]);
+const SKININTHEGAMEBROS_ONLY_SKILLS = new Set(entitlementManifest.skininthegamebrosOnlySkills.map((skill) => skill.trim().toLowerCase()));
 function isSafeAgentFilename(filename) {
     return /^[a-z0-9-]+\.md$/.test(filename);
 }
@@ -317,6 +314,7 @@ function listStandaloneHookLibPayloadFilenames() {
     const filenames = listTemplateHookLibFilenames();
     filenames.add('config-dir.mjs');
     filenames.add('config-dir.sh');
+    filenames.add('state-lock.mjs');
     return filenames;
 }
 const OMC_HOOK_EXTRA_FILENAMES = new Set([
@@ -346,6 +344,9 @@ function getShippedStandaloneHookPayloadPath(filename, location) {
     }
     if (filename === 'config-dir.mjs' || filename === 'config-dir.sh') {
         return join(packageDir, 'scripts', 'lib', filename);
+    }
+    if (filename === 'state-lock.mjs') {
+        return join(packageDir, 'scripts', 'lib', 'state-lock.mjs');
     }
     return join(packageDir, 'templates', 'hooks', 'lib', filename);
 }
@@ -735,6 +736,98 @@ const STANDALONE_HOOK_TEMPLATE_FILES = [
     'persistent-mode.mjs',
     'code-simplifier.mjs',
 ];
+function readStandalonePackageIdentity(packageDir) {
+    let root;
+    try {
+        root = realpathSync(packageDir);
+    }
+    catch {
+        throw new Error('Standalone state-lock provisioning requires a canonical package root');
+    }
+    const packagePath = join(root, 'package.json');
+    const helperPath = join(root, 'scripts', 'lib', 'state-lock.mjs');
+    try {
+        if (!lstatSync(root).isDirectory() || !lstatSync(packagePath).isFile() || !lstatSync(helperPath).isFile())
+            throw new Error();
+        if (realpathSync(packagePath) !== packagePath)
+            throw new Error();
+        const helperReal = realpathSync(helperPath);
+        const helperRelative = relative(root, helperReal);
+        if (isAbsolute(helperRelative) || helperRelative === '..' || helperRelative.startsWith(`..${sep}`))
+            throw new Error();
+    }
+    catch {
+        throw new Error('Standalone state-lock provisioning requires a regular package root, package.json, and scripts/lib/state-lock.mjs');
+    }
+    let manifest;
+    try {
+        manifest = JSON.parse(readFileSync(packagePath, 'utf8'));
+    }
+    catch {
+        throw new Error('Standalone state-lock provisioning requires a valid package.json');
+    }
+    if (!manifest || typeof manifest !== 'object' || manifest.name !== 'oh-my-claude-sisyphus' || manifest.version !== VERSION) {
+        throw new Error(`Standalone state-lock provisioning requires package oh-my-claude-sisyphus version ${VERSION}`);
+    }
+    return { root, name: 'oh-my-claude-sisyphus', version: VERSION, helperPath };
+}
+function standaloneStateLockBridge(packageDir) {
+    const identity = readStandalonePackageIdentity(packageDir);
+    return `import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { relative, isAbsolute, sep } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const PACKAGE_ROOT = ${JSON.stringify(identity.root)};
+const EXPECTED_PACKAGE_NAME = ${JSON.stringify(identity.name)};
+const EXPECTED_PACKAGE_VERSION = ${JSON.stringify(identity.version)};
+const PACKAGE_JSON = PACKAGE_ROOT + '/package.json';
+const HELPER_PATH = PACKAGE_ROOT + '/scripts/lib/state-lock.mjs';
+function validatePackageOwnedHelper() {
+  if (!lstatSync(PACKAGE_ROOT).isDirectory() || realpathSync(PACKAGE_ROOT) !== PACKAGE_ROOT || !lstatSync(PACKAGE_JSON).isFile() || !lstatSync(HELPER_PATH).isFile()) throw new Error('OMC state-lock bridge package root is unavailable');
+  if (realpathSync(PACKAGE_JSON) !== PACKAGE_JSON) throw new Error('OMC state-lock bridge manifest identity changed');
+  const helperReal = realpathSync(HELPER_PATH);
+  const helperRelative = relative(PACKAGE_ROOT, helperReal);
+  if (isAbsolute(helperRelative) || helperRelative === '..' || helperRelative.startsWith('..' + sep)) throw new Error('OMC state-lock bridge helper escapes package root');
+  let manifest;
+  try { manifest = JSON.parse(readFileSync(PACKAGE_JSON, 'utf8')); } catch { throw new Error('OMC state-lock bridge package manifest is invalid'); }
+  if (!manifest || manifest.name !== EXPECTED_PACKAGE_NAME || manifest.version !== EXPECTED_PACKAGE_VERSION) throw new Error('OMC state-lock bridge package identity mismatch');
+}
+validatePackageOwnedHelper();
+const canonical = await import(pathToFileURL(HELPER_PATH).href);
+export const processStartIdentity = canonical.processStartIdentity;
+export const isStateFileLockingSupported = canonical.isStateFileLockingSupported;
+export const isExclusiveStateLockingAvailable = canonical.isExclusiveStateLockingAvailable;
+export const getStateFileLockDiagnostic = canonical.getStateFileLockDiagnostic;
+export const getStateFileLockFailureMessage = canonical.getStateFileLockFailureMessage;
+export const acquireStateFileLockSync = canonical.acquireStateFileLockSync;
+export const releaseStateFileLockSync = canonical.releaseStateFileLockSync;
+export const withStateFileLockSync = canonical.withStateFileLockSync;
+export const acquireRecoveryClaim = canonical.acquireRecoveryClaim;
+export const readRecoveryClaim = canonical.readRecoveryClaim;
+export const releaseRecoveryClaim = canonical.releaseRecoveryClaim;
+export const sameRecoveryClaim = canonical.sameRecoveryClaim;
+export const isEmergencyOwnerLive = canonical.isEmergencyOwnerLive;
+`;
+}
+export function provisionStandaloneStateLockBridge(packageDir, targetPath) {
+    readStandalonePackageIdentity(packageDir);
+    mkdirSync(dirname(targetPath), { recursive: true });
+    const tempPath = `${targetPath}.${process.pid}.${randomUUID()}.tmp`;
+    const fd = openSync(tempPath, 'wx', 0o755);
+    let closed = false;
+    try {
+        writeFileSync(fd, standaloneStateLockBridge(packageDir));
+        closeSync(fd);
+        closed = true;
+        renameSync(tempPath, targetPath);
+    }
+    catch (error) {
+        if (!closed)
+            closeSync(fd);
+        if (existsSync(tempPath))
+            unlinkSync(tempPath);
+        throw error;
+    }
+}
 function ensureStandaloneHookScripts(log) {
     const packageDir = getPackageDir();
     const templatesDir = join(packageDir, 'templates', 'hooks');
@@ -746,6 +839,10 @@ function ensureStandaloneHookScripts(log) {
     if (!existsSync(hooksLibDir)) {
         mkdirSync(hooksLibDir, { recursive: true });
     }
+    const stateLockDest = join(hooksLibDir, 'state-lock.mjs');
+    provisionStandaloneStateLockBridge(packageDir, stateLockDest);
+    if (!isWindows())
+        chmodSync(stateLockDest, 0o755);
     // Hook entrypoints import ./lib/*.mjs at module load time. Reconcile the
     // helper payload before replacing entrypoints so an interrupted update cannot
     // leave fresh hooks pointing at a stale or partial hooks/lib directory.
@@ -756,6 +853,8 @@ function ensureStandaloneHookScripts(log) {
                 if (!statSync(sourcePath).isFile()) {
                     continue;
                 }
+                if (filename === 'state-lock.mjs')
+                    continue;
             }
             catch {
                 continue;
@@ -971,25 +1070,34 @@ export function prunePluginDuplicateAgents(log) {
  * that contain a SKILL.md with OMC frontmatter but are no longer shipped by
  * the current package version. User-created skills are preserved.
  */
-export function cleanupStaleSkills(log) {
+export function cleanupStaleSkills(log, options) {
     const skillsDir = currentSkillsDir();
     if (!existsSync(skillsDir))
         return [];
     const packageSkillsDir = join(getPackageDir(), 'skills');
     const currentSkillNames = new Set();
+    // The keep-set must contain only the directory names the *current* install
+    // mode actually writes. Holding both the raw and `omc-`prefixed variants
+    // stranded the pre-rename copy whenever a skill collided with a Claude Code
+    // native command (e.g. `plan` -> `omc-plan`), leaving both installed.
+    const usesSafeNames = options?.safeStandaloneNames === true;
     if (existsSync(packageSkillsDir)) {
         for (const entry of readdirSync(packageSkillsDir, { withFileTypes: true })) {
             if (entry.isDirectory()) {
-                currentSkillNames.add(entry.name);
-                // Also add the safe standalone name variant
+                if (!usesSafeNames) {
+                    currentSkillNames.add(entry.name);
+                    continue;
+                }
                 const skillMdPath = join(packageSkillsDir, entry.name, 'SKILL.md');
+                let rawName = entry.name;
                 if (existsSync(skillMdPath)) {
                     const content = readFileSync(skillMdPath, 'utf-8');
                     const { metadata } = parseFrontmatter(content);
                     if (typeof metadata.name === 'string' && metadata.name.trim().length > 0) {
-                        currentSkillNames.add(toSafeStandaloneSkillName(metadata.name));
+                        rawName = metadata.name;
                     }
                 }
+                currentSkillNames.add(toSafeStandaloneSkillName(rawName));
             }
         }
     }
@@ -1851,7 +1959,7 @@ function syncBundledSkillDefinitions(log, options) {
     for (const entry of readdirSync(skillsDir, { withFileTypes: true })) {
         if (!entry.isDirectory())
             continue;
-        if (SKININTHEGAMEBROS_ONLY_SKILLS.has(entry.name) && !isSkininthegamebrosUser()) {
+        if (SKININTHEGAMEBROS_ONLY_SKILLS.has(entry.name.toLowerCase()) && !isSkininthegamebrosUser()) {
             continue;
         }
         const sourceDir = join(skillsDir, entry.name);
@@ -2189,6 +2297,10 @@ export function install(options = {}) {
         else {
             log('Skipping agent/command/hook files (managed by plugin system)');
         }
+        // Single source of truth for the installed-directory naming mode: stale
+        // cleanup must evaluate the same mode the sync used, or a renamed skill
+        // leaves its pre-rename directory behind.
+        const useSafeStandaloneSkillNames = !enabledOmcPlugin || options.noPlugin === true;
         if (shouldInstallBundledSkills) {
             log(options.noPlugin
                 ? 'Installing bundled skills from local package (--no-plugin)...'
@@ -2196,7 +2308,7 @@ export function install(options = {}) {
                     ? 'Installing bundled skills from local package (no enabled OMC plugin detected)...'
                     : 'Installing bundled skills from local package (enabled plugin skill files not found)...');
             result.installedSkills.push(...syncBundledSkillDefinitions(log, {
-                safeStandaloneNames: !enabledOmcPlugin || options.noPlugin === true,
+                safeStandaloneNames: useSafeStandaloneSkillNames,
             }));
         }
         else if (pluginProvidesSkillFiles) {
@@ -2212,7 +2324,9 @@ export function install(options = {}) {
         }
         // Clean up stale OMC-created skills from previous versions
         if (existsSync(SKILLS_DIR)) {
-            const removedSkills = cleanupStaleSkills(log);
+            const removedSkills = cleanupStaleSkills(log, {
+                safeStandaloneNames: useSafeStandaloneSkillNames,
+            });
             if (removedSkills.length > 0) {
                 log(`Cleaned up ${removedSkills.length} stale skill(s)`);
             }

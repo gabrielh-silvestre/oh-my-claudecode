@@ -12,6 +12,7 @@ const tempDirs: string[] = [];
 
 function makeTempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), 'omc-preemptive-hook-'));
+  execFileSync('git', ['init', '--quiet', dir], { stdio: 'ignore' });
   tempDirs.push(dir);
   return dir;
 }
@@ -110,18 +111,18 @@ describe('post-tool-verifier preemptive compaction warnings', () => {
     );
 
     expect(commands).not.toContain(
-      'node "$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs "$CLAUDE_PLUGIN_ROOT"/scripts/preemptive-compaction.mjs',
+      'node "${CLAUDE_PLUGIN_ROOT}"/scripts/run.cjs "${CLAUDE_PLUGIN_ROOT}"/scripts/preemptive-compaction.mjs',
     );
     expect(
       commands.some(
         command =>
-          command.includes('"$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs') &&
-          command.includes('"$CLAUDE_PLUGIN_ROOT"/scripts/post-tool-verifier.mjs'),
+          command.includes('"${CLAUDE_PLUGIN_ROOT}"/scripts/run.cjs') &&
+          command.includes('"${CLAUDE_PLUGIN_ROOT}"/scripts/post-tool-verifier.mjs'),
       ),
     ).toBe(true);
     expect(
       commands.some(command =>
-        command.includes('"$CLAUDE_PLUGIN_ROOT"/scripts/preemptive-compaction.mjs'),
+        command.includes('"${CLAUDE_PLUGIN_ROOT}"/scripts/preemptive-compaction.mjs'),
       ),
     ).toBe(false);
   });
@@ -187,7 +188,7 @@ describe('post-tool-verifier preemptive compaction warnings', () => {
     );
 
     expect(first.hookSpecificOutput).toBeDefined();
-    expect(second).toEqual({ continue: true, suppressOutput: true });
+    expect(second).toEqual({ continue: true });
   });
 
   it('does not let one session suppress another session in the same repo', () => {
@@ -396,7 +397,7 @@ describe('post-tool-verifier Write/Edit response envelopes', () => {
       { OMC_QUIET: '2' },
     );
 
-    expect(result).toEqual({ continue: true, suppressOutput: true });
+    expect(result).toEqual({ continue: true });
   });
 
   it('trusts Edit success markers extracted from object response message before JSON stringify analysis', () => {
@@ -413,7 +414,7 @@ describe('post-tool-verifier Write/Edit response envelopes', () => {
       { OMC_QUIET: '2' },
     );
 
-    expect(result).toEqual({ continue: true, suppressOutput: true });
+    expect(result).toEqual({ continue: true });
   });
 
   it('keeps real plain string Write failures failing', () => {

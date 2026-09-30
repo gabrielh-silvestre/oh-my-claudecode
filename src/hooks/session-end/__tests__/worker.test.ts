@@ -11,6 +11,15 @@ const actions = vi.hoisted(() => ({
   runSessionEndNotifications: vi.fn(async () => undefined),
   runSessionEndOpenClaw: vi.fn(async () => undefined),
   runForegroundSessionEndCleanup: vi.fn(async () => undefined),
+  exportSessionSummary: vi.fn(() => undefined),
+  prepareSessionEndWorkerInput: vi.fn(async (_directory: string, input: Record<string, unknown>) => ({
+    transcriptPath: input.transcript_path,
+    cwd: input.cwd,
+    reason: input.reason,
+    input,
+    metrics: { session_id: (input as { session_id?: string }).session_id, reason: input.reason },
+    initialTeamNames: [],
+  })),
 }));
 const processIdentity = vi.hoisted(() => ({
   getProcessStartIdentity: vi.fn(async () => 'test-process-start'),
@@ -31,9 +40,15 @@ import { isManifestTerminal, mutateSessionEndJob, prepareCoreManifest, readSessi
 import { processSessionEndWorker, reconcileSessionEndJobs, workerEnvironment } from '../worker.js';
 
 const directories: string[] = [];
+let previousHome: string | undefined;
+let previousUserProfile: string | undefined;
 
 function project(): string {
   const directory = mkdtempSync(join(tmpdir(), 'omc-session-end-worker-'));
+  previousHome = process.env.HOME;
+  previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = directory;
+  process.env.USERPROFILE = directory;
   directories.push(directory);
   return directory;
 }
@@ -44,6 +59,10 @@ afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
   vi.useRealTimers();
   vi.unstubAllEnvs();
+  if (previousHome === undefined) delete process.env.HOME;
+  else process.env.HOME = previousHome;
+  if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = previousUserProfile;
 });
 
 describe('SessionEnd durable worker', () => {

@@ -6,13 +6,198 @@ This guide covers all migration paths for oh-my-claudecode. Find your current ve
 
 ## Table of Contents
 
+- [Unreleased: Team Instance Ownership](#unreleased-team-instance-ownership)
+- [Unreleased: Cancellation Scope](#unreleased-cancellation-scope)
+- [v4.x → v5.0: Workflow Retirement](#v4x--v50-workflow-retirement)
 - [Unreleased: Team MCP Runtime Deprecation (CLI-Only)](#unreleased-team-mcp-runtime-deprecation-cli-only)
 - [Unreleased: Native Team Worktree Mode (Opt-In)](#unreleased-native-team-worktree-mode-opt-in)
+- [Unreleased: Git-less State Root Recovery](#unreleased-git-less-state-root-recovery)
 - [v3.5.3 → v3.5.5: Test Fixes & Cleanup](#v353--v355-test-fixes--cleanup)
 - [v3.5.2 → v3.5.3: Skill Consolidation](#v352--v353-skill-consolidation)
 - [v2.x → v3.0: Package Rename & Auto-Activation](#v2x--v30-package-rename--auto-activation)
 - [v3.0 → v3.1: Notepad Wisdom & Enhanced Features](#v30--v31-notepad-wisdom--enhanced-features)
 - [v3.x → v4.0: Major Architecture Overhaul](#v3x--v40-major-architecture-overhaul)
+
+---
+
+## Unreleased: Team Instance Ownership
+
+Team startup reserves an immutable instance ID before creating tasks or workers.
+An existing reservation or team state is not overwritten by another start using
+the same name. CLI/MCP jobs retain their original instance ID: cleanup of an old
+job cannot adopt a newer team's configuration.
+
+Native CLI jobs no longer start through the legacy v1 opt-out path. Unset
+`OMC_RUNTIME_V2=0`, `false`, `no`, or `off` before starting a job; disabling v2 is
+rejected before native startup effects rather than selecting weaker cleanup.
+
+Cleanup now requires matching instance and worker-launch evidence. A missing or
+corrupt receipt is not permission to kill a pane or remove state, even with
+`--force`. Older jobs and teams without this evidence are preserved rather than
+automatically upgraded or forcibly deleted. Complete their shutdown using the
+owning runtime before upgrading; do not fabricate IDs or discard receipts to
+bypass a blocked cleanup.
+
+This also applies to API `cleanup` and `orphan-cleanup`: neither is a raw state
+deletion escape hatch. The unsafe low-level `teamCleanup` deletion API is removed.
+SessionEnd cleanup checks the ending Claude session's ownership via config
+`leader_session_id` (not the tmux target projected into `leader.session_id`)
+and passes the captured instance ID; stale team-name hints cannot authorize
+cleanup of another session's team.
+
+Provider execution and pane liveness are observed separately. An exited provider
+can be recovered even when its pane shell remains, but recovery does not treat
+that observation as proof that all descendant processes have terminated.
+
+Tmux ownership additionally binds the socket, server PID, and precise process
+creation time captured at startup. Reused session names or pane IDs after a
+server restart cannot replace that evidence. Missing historical server identity
+does not authorize adoption, input, or destruction. Confirmed death of the
+original server proves only that its panes are gone, not provider cleanup.
+Strict server identity requires the native addon on macOS or boot-bound process
+evidence on Linux; unavailable precision preserves resources without a coarse
+process-listing fallback.
+Native Windows/MSYS tmux control has no verified process-identity mapping and
+therefore cannot authorize these effects. Running Node inside WSL uses the Linux
+identity path.
+
+The legacy mutation exports `watchdogCliWorkers`, `spawnWorkerForTask`,
+`killWorkerPane`, `assignTask`, and `killWorkerPanes` have been removed. Use the instance-bound v2
+startup, dispatch, recovery, scaling, and shutdown APIs instead. The former
+`done.json` watchdog, five automatic pane-death retries, lowest-index scheduling,
+and watchdog timer `stop()` contract are retired, not recreated inside v2.
+
+Final state removal retains instance-bound cleanup records outside the disposable
+team directory. After a partial removal failure, retry cleanup for the original
+job. Do not manually delete these records, including completed receipts: they
+prevent reuse of a retired instance identity. Detached state is removed by the
+validated cleanup protocol.
+
+Pending recovery reservations, intents, and owner requests also retain the
+original instance ID. Records without that evidence are not automatically
+adopted, and retrying an old request cannot attach it to a same-named replacement.
+
+`state_clear(mode="team", ...)` clears orchestration/session state, not native
+team runtime directories or name-only native mission records. Shut down native
+teams through `omc team shutdown` or the original job's cleanup API first.
+Session ownership alone does not prove ownership of a same-name runtime instance.
+
+## Unreleased: Cancellation Scope
+
+`/oh-my-claudecode:cancel --force` now targets only the current session; it no longer
+means clearing every session. It skips graceful waits, not state locks or ownership checks.
+If the current session cannot be identified, cancellation fails closed.
+
+Use `--all` explicitly for all-session cancellation. It follows normal cancellation
+within each session; use `--force --all` when forced cancellation across sessions is intended.
+Update prompts or automation that previously used `--force` for a workspace-wide reset.
+The deprecated `cancel-ralph` alias follows the same contract.
+
+## Unreleased: Git-less State Root Recovery
+
+### TL;DR
+
+Sessions launched outside a Git repository no longer create a separate `.omc/`
+directory for every cwd. OMC uses one canonical `~/.omc/` root, or
+`$OMC_STATE_DIR/non-git` when centralized state is configured. Protected
+locations and descendants of system temp/OS roots are never used as roots.
+
+### Migration and compatibility
+
+- Existing non-git `.omc/` roots remain untouched and are not adopted implicitly.
+  Use `state_migrate_non_git` with the owning `session_id` to copy matching JSON
+  records into the canonical root without overwriting or deleting sources.
+- Existing state under protected locations is never moved or deleted
+  automatically, and cannot be used as a migration source.
+- `OMC_STATE_DIR` remains the explicit centralized option. In git-less sessions
+  it uses one fixed `non-git` child rather than hashing each cwd.
+- `workingDirectory` on state tools is honored within the validated context;
+  foreign repositories and failed Git probes are rejected visibly.
+- Session-scoped state remains owned by its `session_id`. No time-based cleanup
+  or cancellation was added.
+
+---
+
+## v4.x → v5.0: Workflow Retirement
+
+### TL;DR
+
+17 workflow names were **removed outright**, not kept as aliases. The public
+surface is now four canonical workflows — `plan` → `execute` → `review` →
+`verify` — plus a small set of independent workflows and utilities.
+
+If you use `/ultrawork`, `/ultraqa`, `/ccg`, `/sciomc`, `/deep-dive`,
+`/omc-teams`, `/setup`, `/mcp-setup`, `/learner`, or `/writer-memory`, those
+names no longer resolve. Use the replacement in the table below.
+
+### Removed skills and commands
+
+| Removed                | Replacement                              | Notes                                                        |
+| ---------------------- | ---------------------------------------- | ------------------------------------------------------------ |
+| `ultrawork`            | `/oh-my-claudecode:execute` or `/team`   | Use `/team` when you want coordinated parallel workers        |
+| `ultrapilot`           | `/oh-my-claudecode:team`                 | Declared-only; never shipped as a skill file                  |
+| `swarm`                | `/oh-my-claudecode:team`                 | Declared-only                                                 |
+| `pipeline`             | `/oh-my-claudecode:execute`              | Declared-only                                                 |
+| `ultraqa`              | `/oh-my-claudecode:verify`               |                                                               |
+| `merge-readiness`      | `/oh-my-claudecode:review`               | Advisory review; release hard checks are unchanged            |
+| `deep-dive`            | `/oh-my-claudecode:research`             |                                                               |
+| `sciomc`               | `/oh-my-claudecode:research`             |                                                               |
+| `ccg`                  | `/oh-my-claudecode:ask` + `/team`        | Run `/ask codex` and `/ask antigravity`, then synthesize      |
+| `omc-teams`            | `/oh-my-claudecode:team` or `omc team`   |                                                               |
+| `setup`                | `/oh-my-claudecode:omc-setup`            |                                                               |
+| `mcp-setup`            | Claude Code native MCP configuration     | Use `claude mcp add <name> ...` or the path selected by `CLAUDE_MCP_CONFIG_PATH`. |
+| `omc-reference`        | `/oh-my-claudecode:wiki`                 | Model-routing reference moved into the wiki skill             |
+| `learner`              | `/oh-my-claudecode:remember`             |                                                               |
+| `writer-memory`        | `/oh-my-claudecode:remember`             |                                                               |
+| `local-build-reminder` | —                                        | Removed; docs and CI cover the rebuild signal                 |
+| `understanding-gate`   | `/oh-my-claudecode:review`               | Frontmatter alias of the removed merge-readiness              |
+
+Command files removed alongside their skills: `ccg.md`, `deep-dive.md`,
+`learner.md`, `mcp-setup.md`, `omc-teams.md`, `sciomc.md`, `writer-memory.md`.
+
+### What is kept
+
+These were **not** retired, despite routing into the canonical workflows:
+
+- **Canonical Tier-0**: `plan`, `execute`, `review`, `verify`
+- **Independent Tier-0 planning**: `deep-interview`, `ralplan`
+- **Directly invocable workflows**: `autopilot`, `autoresearch`, `ultragoal`, `ralph`
+- **Internal lanes**: `team`, `research`
+- **Surviving aliases**: `psm` → `project-session-manager`, `release` → maintainer-only `omc release`
+
+### Newly available to everyone
+
+`verify`, `remember`, and `debug` were previously gated behind an internal
+entitlement (`USER_TYPE=ant`). They now install for all users — `verify`
+completes the canonical chain and `remember` is the target for the retired
+`learner`/`writer-memory`.
+
+### Installed names
+
+Two skills install under an `omc-` prefix because their names collide with
+Claude Code native commands:
+
+| Skill    | Installed as |
+| -------- | ------------ |
+| `plan`   | `omc-plan`   |
+| `review` | `omc-review` |
+
+### Migration Steps
+
+1. Update any scripts, docs, or prompts that invoke a removed name.
+2. Run `omc setup` (or `/oh-my-claudecode:omc-setup`). The installer prunes the
+   retired skill directories automatically — no manual cleanup needed.
+3. If you pinned a removed skill in `.claude/settings.json` or a project
+   `CLAUDE.md`, replace it using the table above.
+
+### Why these were removed rather than aliased
+
+The alias retirement policy normally requires ≥2 minor releases, ≥90 days, and
+≥95% canonical usage before a name can be removed. A major version is the
+sanctioned place for breaking removals, so 5.0.0 applies a major-boundary
+carve-out (`isMajorBoundaryRemoval`). The carve-out does **not** waive the
+critical-integrations check — an alias with a known critical consumer still
+blocks.
 
 ---
 
@@ -615,7 +800,7 @@ Smart cancellation that auto-detects active mode:
 # Or just say: "stop", "cancel", "abort"
 ```
 
-**Auto-detects and cancels:** autopilot, ralph, ultrawork, ultraqa, pipeline
+**Auto-detects and cancels:** autopilot, ralph, ultrawork, pipeline (ultraqa is retired; stale pre-5.0.0 `ultraqa-state.json` is still cleared)
 
 **Deprecation Notice:**
 Individual cancel commands are deprecated but still work:

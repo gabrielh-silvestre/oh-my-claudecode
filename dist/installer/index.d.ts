@@ -124,6 +124,7 @@ export declare function isRunningAsPlugin(): boolean;
  * @returns true if running as a project-scoped plugin, false otherwise
  */
 export declare function isProjectScopedPlugin(): boolean;
+export declare function provisionStandaloneStateLockBridge(packageDir: string, targetPath: string): void;
 /**
  * Remove stale OMC agents only when their exact raw bytes match the bounded,
  * release-authenticated historical inventory and their basename is absent from
@@ -143,7 +144,9 @@ export declare function prunePluginDuplicateAgents(log: (msg: string) => void): 
  * that contain a SKILL.md with OMC frontmatter but are no longer shipped by
  * the current package version. User-created skills are preserved.
  */
-export declare function cleanupStaleSkills(log: (msg: string) => void): string[];
+export declare function cleanupStaleSkills(log: (msg: string) => void, options?: {
+    safeStandaloneNames?: boolean;
+}): string[];
 /**
  * Remove standalone skill directories that duplicate plugin-provided skills.
  *

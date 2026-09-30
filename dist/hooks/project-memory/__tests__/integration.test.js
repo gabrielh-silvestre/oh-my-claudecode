@@ -7,13 +7,19 @@ import path from "path";
 import os from "os";
 import { contextCollector } from "../../../features/context-injector/collector.js";
 import { registerProjectMemoryContext, clearProjectMemorySession, } from "../index.js";
-import { loadProjectMemory, getMemoryPath } from "../storage.js";
+import { loadProjectMemory, saveProjectMemory, getMemoryPath } from "../storage.js";
 import { learnFromToolOutput } from "../learner.js";
 describe("Project Memory Integration", () => {
     let tempDir;
+    let previousHome;
+    let previousUserProfile;
     beforeEach(async () => {
         delete process.env.OMC_STATE_DIR;
         tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "integration-test-"));
+        previousHome = process.env.HOME;
+        previousUserProfile = process.env.USERPROFILE;
+        process.env.HOME = tempDir;
+        process.env.USERPROFILE = tempDir;
     });
     afterEach(async () => {
         delete process.env.OMC_STATE_DIR;
@@ -28,6 +34,14 @@ describe("Project Memory Integration", () => {
         contextCollector.clear("test-session-8");
         contextCollector.clear("test-session-scope");
         await fs.rm(tempDir, { recursive: true, force: true });
+        if (previousHome === undefined)
+            delete process.env.HOME;
+        else
+            process.env.HOME = previousHome;
+        if (previousUserProfile === undefined)
+            delete process.env.USERPROFILE;
+        else
+            process.env.USERPROFILE = previousUserProfile;
     });
     describe("End-to-end SessionStart flow", () => {
         it("should detect, persist, and inject context on first session", async () => {
@@ -316,16 +330,26 @@ describe("Project Memory Integration", () => {
         });
     });
     describe("End-to-end PostToolUse learning flow", () => {
-        it("should learn build command from Bash execution", async () => {
+        it("should not learn build or test commands from Bash execution history", async () => {
             const packageJson = { name: "test", scripts: {} };
             await fs.writeFile(path.join(tempDir, "package.json"), JSON.stringify(packageJson));
             const sessionId = "test-session-5";
             await registerProjectMemoryContext(sessionId, tempDir);
             let memory = await loadProjectMemory(tempDir);
             expect(memory?.build.buildCommand).toBeNull();
+            expect(memory?.build.testCommand).toBeNull();
             await learnFromToolOutput("Bash", { command: "npm run build" }, "", tempDir);
+            await learnFromToolOutput("Bash", { command: "npm test" }, "", tempDir);
             memory = await loadProjectMemory(tempDir);
-            expect(memory?.build.buildCommand).toBe("npm run build");
+            expect(memory?.build.buildCommand).toBeNull();
+            expect(memory?.build.testCommand).toBeNull();
+            memory.build.buildCommand = "trusted build";
+            memory.build.testCommand = "trusted test";
+            await saveProjectMemory(tempDir, memory);
+            await learnFromToolOutput("Bash", { command: "npm run build && npm test" }, "", tempDir);
+            memory = await loadProjectMemory(tempDir);
+            expect(memory?.build.buildCommand).toBe("trusted build");
+            expect(memory?.build.testCommand).toBe("trusted test");
         });
         it("should learn environment hints from command output", async () => {
             const packageJson = { name: "test" };

@@ -15,10 +15,10 @@ import type {
   ExternalModelsConfig,
   DelegationProvider,
   TeamRoleAssignmentSpec,
+  ModelType,
 } from "../shared/types.js";
 import {
   CANONICAL_TEAM_ROLES,
-  CURSOR_EXECUTOR_TEAM_ROLES,
   KNOWN_AGENT_NAMES,
 } from "../shared/types.js";
 import { getConfigDir } from "../utils/paths.js";
@@ -89,7 +89,6 @@ export function buildDefaultConfig(): PluginConfig {
       maxBackgroundTasks: 5,
     },
     magicKeywords: {
-      ultrawork: ["ultrawork", "ulw", "uw"],
       search: ["search", "find", "locate"],
       analyze: ["analyze", "investigate", "examine"],
       ultrathink: ["ultrathink", "think", "reason", "ponder"],
@@ -199,7 +198,7 @@ export function buildDefaultConfig(): PluginConfig {
         context: ["CONTEXT"],
       },
       blockingTools: ["Edit", "MultiEdit", "Write", "Agent", "Task"],
-      executionKeywords: ["ralph", "ultrawork", "autopilot"],
+      executionKeywords: ["ralph", "autopilot"],
     },
   };
 }
@@ -270,6 +269,15 @@ export function deepMerge<T extends object>(target: T, source: Partial<T>): T {
   return result as T;
 }
 
+const MIN_BACKGROUND_TASKS = 1;
+const MAX_BACKGROUND_TASKS = 50;
+
+function parseBackgroundTaskLimit(value: string | undefined): number | null {
+  if (typeof value !== "string" || !/^[1-9]\d*$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed <= MAX_BACKGROUND_TASKS ? parsed : null;
+}
+
 /**
  * Load configuration from environment variables
  */
@@ -299,14 +307,14 @@ export function loadEnvConfig(): Partial<PluginConfig> {
     };
   }
 
-  if (process.env.OMC_MAX_BACKGROUND_TASKS) {
-    const maxTasks = parseInt(process.env.OMC_MAX_BACKGROUND_TASKS, 10);
-    if (!isNaN(maxTasks)) {
-      config.permissions = {
-        ...config.permissions,
-        maxBackgroundTasks: maxTasks,
-      };
-    }
+  const maxBackgroundTasks = parseBackgroundTaskLimit(
+    process.env.OMC_MAX_BACKGROUND_TASKS,
+  );
+  if (maxBackgroundTasks !== null) {
+    config.permissions = {
+      ...config.permissions,
+      maxBackgroundTasks,
+    };
   }
 
   // Routing configuration from environment
@@ -334,8 +342,8 @@ export function loadEnvConfig(): Partial<PluginConfig> {
     }
   }
 
-  // Model alias overrides from environment (issue #1211)
-  const aliasKeys = ["HAIKU", "SONNET", "OPUS"] as const;
+  // Model alias overrides from environment (issue #1211, issue #3726)
+  const aliasKeys = ["HAIKU", "SONNET", "OPUS", "FABLE"] as const;
   const modelAliases: Record<string, string> = {};
   for (const key of aliasKeys) {
     const envVal = process.env[`OMC_MODEL_ALIAS_${key}`];
@@ -347,9 +355,8 @@ export function loadEnvConfig(): Partial<PluginConfig> {
   if (Object.keys(modelAliases).length > 0) {
     config.routing = {
       ...config.routing,
-      modelAliases: modelAliases as Record<
-        string,
-        "haiku" | "sonnet" | "opus" | "inherit"
+      modelAliases: modelAliases as Partial<
+        Record<"haiku" | "sonnet" | "opus" | "fable", ModelType>
       >,
     };
   }
@@ -393,6 +400,14 @@ export function loadEnvConfig(): Partial<PluginConfig> {
   } else if (process.env.OMC_GROK_DEFAULT_MODEL) {
     // Legacy fallback
     externalModelsDefaults.grokModel = process.env.OMC_GROK_DEFAULT_MODEL;
+  }
+
+  if (process.env.OMC_EXTERNAL_MODELS_DEFAULT_CURSOR_MODEL) {
+    externalModelsDefaults.cursorModel =
+      process.env.OMC_EXTERNAL_MODELS_DEFAULT_CURSOR_MODEL;
+  } else if (process.env.OMC_CURSOR_DEFAULT_MODEL) {
+    // Legacy fallback
+    externalModelsDefaults.cursorModel = process.env.OMC_CURSOR_DEFAULT_MODEL;
   }
 
   if (process.env.OMC_EXTERNAL_MODELS_DEFAULT_ANTIGRAVITY_MODEL) {
@@ -497,7 +512,6 @@ function warnOnDeprecatedDelegationRouting(config: PluginConfig): void {
  * Throws a descriptive error naming offending key + allowed values.
  */
 const CANONICAL_TEAM_ROLE_SET = new Set<string>(CANONICAL_TEAM_ROLES);
-const CURSOR_EXECUTOR_TEAM_ROLE_SET = new Set<string>(CURSOR_EXECUTOR_TEAM_ROLES);
 const KNOWN_AGENT_NAME_SET = new Set<string>(KNOWN_AGENT_NAMES);
 // /team CLI workers — codex/gemini/grok/cursor here are CLI integrations, NOT the deprecated MCP delegationRouting providers.
 const TEAM_ROLE_PROVIDERS = new Set(["claude", "codex", "gemini", "grok", "cursor", "antigravity"]);
@@ -570,11 +584,6 @@ export function validateTeamConfig(config: PluginConfig): void {
       if (typeof spec.provider !== "string" || !TEAM_ROLE_PROVIDERS.has(spec.provider)) {
         throw new Error(
           `[OMC] team.roleRouting.${rawRoleKey}.provider: invalid value "${String(spec.provider)}". Allowed: ${[...TEAM_ROLE_PROVIDERS].join(", ")}`,
-        );
-      }
-      if (spec.provider === "cursor" && !CURSOR_EXECUTOR_TEAM_ROLE_SET.has(normalized)) {
-        throw new Error(
-          `[OMC] team.roleRouting.${rawRoleKey}.provider: cursor is only supported for executor-style roles (${[...CURSOR_EXECUTOR_TEAM_ROLE_SET].join(", ")})`,
         );
       }
     }
@@ -1134,8 +1143,8 @@ export function generateConfigSchema(): object {
           maxBackgroundTasks: {
             type: "integer",
             default: 5,
-            minimum: 1,
-            maximum: 50,
+            minimum: MIN_BACKGROUND_TASKS,
+            maximum: MAX_BACKGROUND_TASKS,
           },
         },
       },
@@ -1143,7 +1152,6 @@ export function generateConfigSchema(): object {
         type: "object",
         description: "Magic keyword triggers",
         properties: {
-          ultrawork: { type: "array", items: { type: "string" } },
           search: { type: "array", items: { type: "string" } },
           analyze: { type: "array", items: { type: "string" } },
           ultrathink: { type: "array", items: { type: "string" } },
@@ -1214,6 +1222,10 @@ export function generateConfigSchema(): object {
                 type: "string",
                 default: BUILTIN_EXTERNAL_MODEL_DEFAULTS.antigravityModel,
                 description: "Default Antigravity model",
+              },
+              cursorModel: {
+                type: "string",
+                description: "Default Cursor model (ids from `cursor-agent --list-models`)",
               },
             },
           },

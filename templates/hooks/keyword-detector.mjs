@@ -10,21 +10,19 @@
  * 2. ralph: Persistence mode until task completion
  * 3. autopilot: Full autonomous execution
  * 4. team: Explicit-only via /team (not auto-triggered)
- * 5. ultrawork/ulw: Maximum parallel execution
- * 6. ccg: Claude-Codex-Gemini tri-model orchestration
- * 7. ralplan: Iterative planning with consensus
- * 8. deep interview: Socratic interview workflow
- * 9. ai-slop-cleaner: Cleanup/deslop anti-slop workflow
- * 10. tdd: Test-driven development
- * 11. code review: Comprehensive review mode
- * 12. security review: Security-focused review mode
- * 13. ultrathink: Extended reasoning
- * 14. deepsearch: Codebase search (restricted patterns)
- * 15. analyze: Analysis mode (restricted patterns)
+ * 5. ralplan: Iterative planning with consensus
+ * 6. deep interview: Socratic interview workflow
+ * 7. ai-slop-cleaner: Cleanup/deslop anti-slop workflow
+ * 8. tdd: Test-driven development
+ * 9. code review: Comprehensive review mode
+ * 10. security review: Security-focused review mode
+ * 11. ultrathink: Extended reasoning
+ * 12. deepsearch: Codebase search (restricted patterns)
+ * 13. analyze: Analysis mode (restricted patterns)
  */
 
 import { writeFileSync, mkdirSync, existsSync, unlinkSync, readFileSync } from 'fs';
-import { join, dirname, resolve } from 'path';
+import { join, dirname, resolve, isAbsolute } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath, pathToFileURL } from 'url';
 
@@ -33,7 +31,7 @@ const __dirname = dirname(__filename);
 
 // Dynamic import for the shared stdin module (use pathToFileURL for Windows compatibility, #524)
 const { readStdin } = await import(pathToFileURL(join(__dirname, 'lib', 'stdin.mjs')).href);
-const { atomicWriteFileSync, recoverEmergencyStateFile, withStateFileLockSync } = await import(pathToFileURL(join(__dirname, 'lib', 'atomic-write.mjs')).href);
+const { atomicWriteFileSync, getStateFileLockFailureMessage, recoverEmergencyStateFile, withStateFileLockSync } = await import(pathToFileURL(join(__dirname, 'lib', 'atomic-write.mjs')).href);
 const { getClaudeConfigDir } = await import(pathToFileURL(join(__dirname, 'lib', 'config-dir.mjs')).href);
 const { resolveSessionStatePathsForHook } = await import(pathToFileURL(join(__dirname, 'lib', 'state-root.mjs')).href);
 const { parseWorkflowInvocation, selectWorkflowProfile, createWorkflowState, isValidWorkflowTrackingState, isWorkflowRuntimeSupported, resolveWorkflowStagePrompt, takeWorkflowTranscriptFailure } = await import(pathToFileURL(join(__dirname, 'lib', 'workflow-profile-runtime.mjs')).href);
@@ -148,6 +146,10 @@ function extractPrompt(input) {
 
 function isExplicitAskSlashInvocation(prompt) {
   return /^\s*\/(?:oh-my-claudecode:)?ask\s+(?:claude|codex|gemini|grok)\b/i.test(prompt);
+}
+
+function isRetiredSlashInvocation(prompt) {
+  return /^\s*\/(?:omc:|oh-my-claudecode:)?(?:ultrawork|ulw|uw|울트라워크|ウルトラワーク|ccg|claude-codex-gemini|씨씨지|シーシージー)(?=\s|$|[?!.,;:])/i.test(prompt);
 }
 
 // Sanitize text to prevent false positives from code blocks, XML tags, URLs, and file paths
@@ -388,7 +390,6 @@ const SYSTEM_ECHO_BLOCK_PATTERNS = [
   buildEchoBlockRegex('\\[AUTOPILOT[^\\]\\n]*\\]'),
   buildEchoBlockRegex('\\[ULTRAPILOT[^\\]\\n]*\\]'),
   buildEchoBlockRegex('\\[ULTRAWORK[^\\]\\n]*\\]'),
-  buildEchoBlockRegex('\\[ULTRAQA[^\\]\\n]*\\]'),
   buildEchoBlockRegex('\\[PIPELINE[^\\]\\n]*\\]'),
   buildEchoBlockRegex('\\[SWARM[^\\]\\n]*\\]'),
   buildEchoBlockRegex('\\[TOOL ERROR[^\\]\\n]*\\]'),
@@ -911,7 +912,7 @@ async function activateState(directory, prompt, stateName, sessionId) {
   const writeState = (writePath, authorizeState) => {
     try {
       mkdirSync(dirname(writePath), { recursive: true });
-      withStateFileLockSync(writePath, () => {
+      const locked = withStateFileLockSync(writePath, () => {
         if (!recoverEmergencyStateFile(writePath, authorizeState ? { authorizeState } : undefined)) return;
         // Shared home fallbacks are project-scoped. A foreign or unverifiable
         // primary/recovery generation must win over this activation.
@@ -940,27 +941,31 @@ async function activateState(directory, prompt, stateName, sessionId) {
         }
         atomicWriteFileSync(writePath, JSON.stringify(state, null, 2));
       });
+      if (!locked.acquired) return getStateFileLockFailureMessage();
     } catch {}
+    return null;
   };
 
 
   const safeSessionId = sessionId && SESSION_ID_ALLOWLIST.test(sessionId) ? sessionId : undefined;
   const { writePath } = await resolveSessionStatePathsForHook(directory, stateName, safeSessionId);
-  writeState(writePath);
+  const writeFailure = writeState(writePath);
+  if (writeFailure) return writeFailure;
 
   // The standalone compatibility fallback is shared by every project, so it
   // may only recover or replace generations owned by this canonical project.
   const globalStatePath = join(homedir(), '.omc', 'state', `${stateName}-state.json`);
   const authorizeGlobalState = (candidate) =>
     typeof candidate?.project_path === 'string' && resolve(candidate.project_path) === resolve(directory);
-  writeState(globalStatePath, authorizeGlobalState);
+  const globalWriteFailure = writeState(globalStatePath, authorizeGlobalState);
+  if (globalWriteFailure) return globalWriteFailure;
   return workflowIntegrityFailure ? 'workflow_descriptor_integrity_failed' : null;
 
 }
 
 function retireStaleWorkflowCancelSignal(statePath, workflowRunId) {
   const signalPath = join(dirname(statePath), 'cancel-signal-state.json');
-  withStateFileLockSync(signalPath, () => {
+  const locked = withStateFileLockSync(signalPath, () => {
     if (!existsSync(signalPath)) return;
     try {
       const signal = JSON.parse(readFileSync(signalPath, 'utf8'));
@@ -969,6 +974,8 @@ function retireStaleWorkflowCancelSignal(statePath, workflowRunId) {
       // Malformed signals fail closed in Stop and are left for explicit cleanup.
     }
   });
+  if (!locked.acquired) return getStateFileLockFailureMessage();
+  return null;
 }
 
 async function resumeWorkflowProfile(directory, sessionId, workflowName) {
@@ -997,7 +1004,8 @@ async function resumeWorkflowProfile(directory, sessionId, workflowName) {
     if (result.value?.error === 'workflow_transcript_record_too_large') throw new Error('workflow_transcript_record_too_large');
     if (result.value?.error) throw new Error('workflow_descriptor_integrity_failed');
     if (!result.acquired || !result.value?.stagePrompt) return null;
-    retireStaleWorkflowCancelSignal(writePath, result.value.workflowRunId);
+    const cleanupFailure = retireStaleWorkflowCancelSignal(writePath, result.value.workflowRunId);
+    if (cleanupFailure) process.stderr.write(`[OMC] ${cleanupFailure}\n`);
     return result.value.stagePrompt;
   } catch (error) {
     if (error?.message === 'workflow_emergency_recovery_failed' || error?.message === 'workflow_transcript_record_too_large') throw error;
@@ -1051,7 +1059,8 @@ async function activateWorkflowProfile(directory, sessionId, task, workflow, tra
     if (result.acquired && result.value?.error === 'workflow_integrity_failure') throw new Error('workflow_descriptor_integrity_failed');
     if (result.acquired && result.value?.error === 'workflow_recovery_failure') throw new Error('workflow_emergency_recovery_failed');
     if (!result.acquired || !result.value || typeof result.value.stagePrompt !== 'string') return null;
-    retireStaleWorkflowCancelSignal(writePath, result.value.workflowRunId);
+    const cleanupFailure = retireStaleWorkflowCancelSignal(writePath, result.value.workflowRunId);
+    if (cleanupFailure) process.stderr.write(`[OMC] ${cleanupFailure}\n`);
     return result.value.stagePrompt;
   } catch (error) {
     if (error?.message === 'workflow_emergency_recovery_failed' || error?.message === 'workflow_transcript_record_too_large') throw error;
@@ -1096,19 +1105,22 @@ async function linkRalphTeam(directory, sessionId) {
  * Create a compact skill invocation guide without inlining SKILL.md bodies.
  * Full skill text remains available by path, avoiding UserPromptSubmit token blowups.
  */
-function createSkillInvocation(skillName, originalPrompt, args = '') {
+function createSkillInvocation(skillName, originalPrompt, args = '', directory = '') {
   const argsSection = args ? `
 Arguments: ${args}` : '';
   const skillPath = resolveSkillPath(skillName);
   const pathStatus = existsSync(skillPath)
     ? `Read fallback: open ${skillPath} and follow its SKILL.md instructions.`
     : `Read fallback: locate skills/${skillName}/SKILL.md in the active oh-my-claudecode plugin/install and follow it.`;
+  const ralphLoopNotice = skillName === 'ralph' ? findOfficialRalphLoopNotice(directory) : '';
 
   return `[MAGIC KEYWORD: ${skillName.toUpperCase()}]
 
 Skill routing detected: ${skillName}
 Preferred invocation: /oh-my-claudecode:${skillName}${args ? ` ${args}` : ''}
-${pathStatus}${argsSection}
+${pathStatus}${argsSection}${ralphLoopNotice ? `
+
+${ralphLoopNotice}` : ''}
 
 User request (compact echo; original prompt remains authoritative):
 ${compactHookText(originalPrompt)}
@@ -1119,10 +1131,10 @@ IMPORTANT: Start the ${skillName} workflow immediately. If the slash invocation 
 /**
  * Create multi-skill invocation message for combined keywords
  */
-function createMultiSkillInvocation(skills, originalPrompt) {
+function createMultiSkillInvocation(skills, originalPrompt, directory = '') {
   if (skills.length === 0) return '';
   if (skills.length === 1) {
-    return createSkillInvocation(skills[0].name, originalPrompt, skills[0].args);
+    return createSkillInvocation(skills[0].name, originalPrompt, skills[0].args, directory);
   }
 
   const skillBlocks = skills.map((s, i) => {
@@ -1136,28 +1148,24 @@ Preferred invocation: /oh-my-claudecode:${s.name}${argsText}
 ${pathStatus}`;
   }).join('\n\n');
 
+  // Multi-skill routing (e.g. `/ralph deep-interview`) must carry the same
+  // disambiguation notice as the single-skill path, or it becomes a bypass.
+  const ralphLoopNotice = skills.some((s) => s.name === 'ralph')
+    ? findOfficialRalphLoopNotice(directory)
+    : '';
+
   return `[MAGIC KEYWORDS DETECTED: ${skills.map(s => s.name.toUpperCase()).join(', ')}]
 
 Execute ALL detected workflows in order using compact invocation guidance. Do not inline full SKILL.md files into the prompt.
 
-${skillBlocks}
+${skillBlocks}${ralphLoopNotice ? `
+
+${ralphLoopNotice}` : ''}
 
 User request (compact echo; original prompt remains authoritative):
 ${compactHookText(originalPrompt)}
 
 IMPORTANT: Complete ALL skills listed above in order. Start with the first skill IMMEDIATELY.`;
-}
-
-/**
- * Create combined output for multiple skill matches
- */
-function createCombinedOutput(skillMatches, originalPrompt) {
-  const parts = [];
-  if (skillMatches.length > 0) {
-    parts.push('## Section 1: Skill Invocations\n\n' + createMultiSkillInvocation(skillMatches, originalPrompt));
-  }
-  const allNames = skillMatches.map(m => m.name.toUpperCase());
-  return `[MAGIC KEYWORDS DETECTED: ${allNames.join(', ')}]\n\n${parts.join('\n\n---\n\n')}\n\nIMPORTANT: Complete ALL sections above in order.`;
 }
 
 /**
@@ -1176,8 +1184,8 @@ function resolveConflicts(matches) {
   // Team keyword detection removed — team is now explicit-only via /team skill.
 
   // Sort by priority order
-  const priorityOrder = ['cancel','ralph','autopilot','ultrawork',
-    'ccg','ralplan','deep-interview','ai-slop-cleaner','tdd','code-review','security-review','ultrathink','deepsearch','analyze'];
+  const priorityOrder = ['cancel','ralph','autopilot','ralplan',
+    'deep-interview','ai-slop-cleaner','tdd','code-review','security-review','ultrathink','deepsearch','analyze'];
   resolved.sort((a, b) => priorityOrder.indexOf(a.name) - priorityOrder.indexOf(b.name));
 
   return resolved;
@@ -1222,6 +1230,157 @@ function isTeamEnabled() {
     }
     return false;
   } catch { return false; }
+}
+
+/**
+ * Detect an installed AND enabled official Anthropic `ralph-loop` plugin
+ * that exposes a `/ralph-loop` command, without scanning any plugin payloads.
+ *
+ * Two independent signals, following existing installer semantics
+ * (`hasEnabledOmcPlugin` in src/installer/index.ts):
+ *
+ * 1. INSTALLED: the machine-readable plugin registry
+ *    `[$CLAUDE_CONFIG_DIR|~/.claude]/plugins/installed_plugins.json` contains
+ *    the official id `ralph-loop@claude-plugins-official` with a real
+ *    `commands/ralph-loop.md` payload under its installPath. The registry's
+ *    own `enabled` flag is deliberately NOT consulted: it does not
+ *    authoritatively encode enablement (a plugin disabled through canonical
+ *    settings can still carry `enabled: true`, and vice versa).
+ * 2. ENABLED: the official id is enabled by the effective Claude Code settings
+ *    for the active project, resolved highest-precedence-first across
+ *    `<project>/.claude/settings.local.json`, `<project>/.claude/settings.json`
+ *    and `[$CLAUDE_CONFIG_DIR|~/.claude]/settings.json`. Within a file the
+ *    canonical `enabledPlugins` field decides (legacy `plugins` field accepted
+ *    for backward compatibility), as an array of plugin ids or a map whose
+ *    value is not `false`. Missing or malformed settings are treated as not
+ *    enabled, exactly like the installer.
+ *
+ * Both signals match the FULL plugin id exactly, marketplace suffix included.
+ * The suffix is never stripped, so a same-named community plugin
+ * (`ralph-loop@community`) can never stand in for the official one — not even
+ * when the official plugin is installed and explicitly disabled.
+ *
+ * No SKILL.md body, command body, or private payload is ever read.
+ *
+ * Returns a short notice string, or '' when the official plugin is not
+ * installed and enabled.
+ */
+const OFFICIAL_RALPH_LOOP_PLUGIN_ID = 'ralph-loop@claude-plugins-official';
+
+function isOfficialRalphLoopPluginId(value) {
+  return typeof value === 'string'
+    && value.trim().toLowerCase() === OFFICIAL_RALPH_LOOP_PLUGIN_ID;
+}
+
+/**
+ * Enablement verdict of a single settings field for the official plugin:
+ * `true`/`false` when the field mentions the official id, `null` when it does
+ * not mention it at all (so the next field may decide).
+ */
+function officialRalphLoopEnablementIn(field) {
+  if (Array.isArray(field)) {
+    return field.some((id) => isOfficialRalphLoopPluginId(id)) ? true : null;
+  }
+  if (field && typeof field === 'object') {
+    for (const [id, value] of Object.entries(field)) {
+      if (isOfficialRalphLoopPluginId(id)) return value !== false;
+    }
+  }
+  return null;
+}
+
+function officialRalphLoopEnablementInSettings(settings) {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return null;
+  // Canonical `enabledPlugins` wins outright when it mentions the official id;
+  // the legacy `plugins` field only decides when canonical is silent about it.
+  for (const field of [settings.enabledPlugins, settings.plugins]) {
+    const verdict = officialRalphLoopEnablementIn(field);
+    if (verdict !== null) return verdict;
+  }
+  return null;
+}
+
+/**
+ * A hook payload's cwd is caller-supplied. Only an absolute path is a usable
+ * project root; anything else would silently resolve a caller-controlled
+ * fragment against the hook process cwd, so it is rejected in favour of the
+ * hook's own cwd.
+ */
+function resolveSettingsProjectRoot(directory) {
+  return typeof directory === 'string' && directory.length > 0 && isAbsolute(directory)
+    ? directory
+    : process.cwd();
+}
+
+/**
+ * Claude Code resolves `enabledPlugins` across settings scopes, so a project may
+ * enable a plugin the user scope never mentions, or disable one the user scope
+ * enables. Highest precedence first; the first scope that mentions the official
+ * id decides, scopes that never mention it are transparent, and a malformed
+ * file fails closed (no notice).
+ */
+function isOfficialRalphLoopEnabledForProject(directory) {
+  const projectRoot = resolveSettingsProjectRoot(directory);
+  const settingsPaths = [
+    join(projectRoot, '.claude', 'settings.local.json'),
+    join(projectRoot, '.claude', 'settings.json'),
+    join(getClaudeConfigDir(), 'settings.json'),
+  ];
+  for (const settingsPath of settingsPaths) {
+    if (!existsSync(settingsPath)) continue;
+    let settings;
+    try {
+      settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    } catch {
+      return false;
+    }
+    const verdict = officialRalphLoopEnablementInSettings(settings);
+    if (verdict !== null) return verdict;
+  }
+  return false;
+}
+
+function findOfficialRalphLoopNotice(directory) {
+  if (!isOfficialRalphLoopEnabledForProject(directory)) {
+    return '';
+  }
+
+  const installedPluginsPath = join(getClaudeConfigDir(), 'plugins', 'installed_plugins.json');
+  if (!existsSync(installedPluginsPath)) {
+    return '';
+  }
+
+  let registry;
+  try {
+    registry = JSON.parse(readFileSync(installedPluginsPath, 'utf-8'));
+  } catch {
+    return '';
+  }
+  if (!registry || typeof registry !== 'object' || Array.isArray(registry)) {
+    return '';
+  }
+
+  const plugins = registry.plugins ?? registry;
+  if (!plugins || typeof plugins !== 'object' || Array.isArray(plugins)) {
+    return '';
+  }
+
+  const entries = plugins[OFFICIAL_RALPH_LOOP_PLUGIN_ID];
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return '';
+  }
+
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object') continue;
+    const installPath = entry.installPath;
+    if (typeof installPath !== 'string' || installPath.length === 0) continue;
+    const commandFile = join(installPath, 'commands', 'ralph-loop.md');
+    if (existsSync(commandFile)) {
+      return 'Note: the official Anthropic `ralph-loop` plugin is also installed. `/ralph` runs OMC\'s ralph; use `/ralph-loop` for the official plugin.';
+    }
+  }
+
+  return '';
 }
 
 // Read the OMC JSONC config the way src/config/loader.ts does, inlined so the
@@ -1401,6 +1560,11 @@ async function main() {
       return;
     }
 
+    if (isRetiredSlashInvocation(prompt)) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
+
     // `/ask <provider> ...` delegates the remainder of the prompt to an
     // advisor process. Magic keywords inside that delegated payload must not
     // activate modes in the current Claude Code session.
@@ -1434,17 +1598,6 @@ async function main() {
 
     // Team keyword detection removed — team mode is now explicit-only via /team skill.
     // This prevents infinite spawning when Claude workers receive prompts containing "team".
-
-    // Ultrawork keywords
-    if (hasActionableKeyword(cleanPrompt, /\b(ultrawork|ulw)\b|(울트라워크)|(ウルトラワーク)/i)) {
-      matches.push({ name: 'ultrawork', args: '' });
-    }
-
-
-    // CCG keywords (Claude-Codex-Gemini tri-model orchestration)
-    if (hasActionableKeyword(cleanPrompt, /\b(ccg|claude-codex-gemini)\b|(씨씨지)|(シーシージー)/i)) {
-      matches.push({ name: 'ccg', args: '' });
-    }
 
     // Ralplan keyword
     if (hasActionableRalplanKeyword(cleanPrompt, /\b(ralplan)\b|(랄플랜)|(ラルプラン)/i)) {
@@ -1531,26 +1684,25 @@ async function main() {
 
     // Route cancellation without mutating state; the cancel workflow commits the primary mode first.
     if (resolved.length > 0 && resolved[0].name === 'cancel') {
-      console.log(JSON.stringify(createHookOutput(createSkillInvocation('cancel', prompt))));
+      console.log(JSON.stringify(createHookOutput(createSkillInvocation('cancel', prompt, '', directory))));
       return;
     }
 
     // Activate states for modes that need them
     const sessionId = data.sessionId || data.session_id || data.sessionid || '';
-    const stateModes = resolved.filter(m => ['ralph', 'autopilot', 'ultrawork'].includes(m.name));
+    const stateModes = resolved.filter(m => ['ralph', 'autopilot'].includes(m.name));
     for (const mode of stateModes) {
       const activationError = await activateState(directory, prompt, mode.name, sessionId);
       if (activationError === 'workflow_descriptor_integrity_failed') {
         console.log(JSON.stringify(createHookOutput('workflow_descriptor_integrity_failed')));
         return;
       }
-    }
-
-    // Special: Ralph with ultrawork (ralph always includes ultrawork)
-    const hasRalph = resolved.some(m => m.name === 'ralph');
-    const hasUltrawork = resolved.some(m => m.name === 'ultrawork');
-    if (hasRalph && !hasUltrawork) {
-      await activateState(directory, prompt, 'ultrawork', sessionId);
+      if (activationError) {
+        console.log(JSON.stringify(createHookOutput(
+          `[OMC STATE ERROR] ${activationError} No ${mode.name} state was activated.`,
+        )));
+        return;
+      }
     }
 
     const additionalContextParts = [];
@@ -1575,7 +1727,7 @@ async function main() {
     }
 
     if (resolved.length > 0) {
-      additionalContextParts.push(createMultiSkillInvocation(resolved, prompt));
+      additionalContextParts.push(createMultiSkillInvocation(resolved, prompt, directory));
     }
 
     if (additionalContextParts.length > 0) {

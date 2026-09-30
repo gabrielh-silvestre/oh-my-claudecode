@@ -9,10 +9,12 @@
  * of {worktree}/.omc/. This preserves state across worktree deletions.
  */
 import { createHash } from 'crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { execFileSync } from 'child_process';
-import { existsSync, mkdirSync, readFileSync, realpathSync, readdirSync, writeFileSync, unlinkSync } from 'fs';
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, readdirSync, writeFileSync, unlinkSync, statSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { resolve, normalize, relative, sep, join, isAbsolute, basename, dirname } from 'path';
+import { pathToFileURL } from 'url';
 import { getClaudeConfigDir } from '../utils/config-dir.js';
 import { encodeProjectPath } from '../utils/encode-project-path.js';
 /**
@@ -51,10 +53,38 @@ export const OmcPaths = {
  */
 const MAX_WORKTREE_CACHE_SIZE = 8;
 const worktreeCacheMap = new Map();
-/** LRU cache for literal git-toplevel lookups (getGitTopLevel, no submodule climb). */
-const toplevelCacheMap = new Map();
+/** Positive Git roots used by state/path construction; security callers probe fresh. */
+const gitTopLevelCacheMap = new Map();
 /** LRU cache for outermost superproject root lookups, including negative results. */
 const superprojectCacheMap = new Map();
+const canonicalWorkingDirectoryRoots = new WeakMap();
+const GIT_PROBE_ENVIRONMENT_KEYS = [
+    'PATH',
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+    'GIT_COMMON_DIR',
+    'GIT_EXEC_PATH',
+    'GIT_CEILING_DIRECTORIES',
+    'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+    'GIT_CONFIG_SYSTEM',
+    'GIT_CONFIG_GLOBAL',
+    'GIT_CONFIG_NOSYSTEM',
+    'GIT_CONFIG_COUNT',
+    'GIT_CONFIG_PARAMETERS',
+    'GIT_INDEX_FILE',
+    'HOME',
+    'XDG_CONFIG_HOME',
+];
+const MAX_GIT_MARKER_BYTES = 4096;
+function gitProbeEnvironmentSignature() {
+    const fixedEntries = GIT_PROBE_ENVIRONMENT_KEYS
+        .map((key) => JSON.stringify([key, process.env[key] !== undefined, process.env[key] ?? '']));
+    const dynamicEntries = Object.keys(process.env)
+        .filter((key) => /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key))
+        .sort()
+        .map((key) => JSON.stringify([key, process.env[key] !== undefined, process.env[key] ?? '']));
+    return [...fixedEntries, ...dynamicEntries].join('\0');
+}
 /**
  * LRU cache for workspace marker lookups.
  */
@@ -159,10 +189,13 @@ function isDefinitiveNonGitError(error) {
 function resolveSuperprojectRoot(cwd) {
     const cacheKey = resolve(cwd);
     if (superprojectCacheMap.has(cacheKey)) {
-        const cached = superprojectCacheMap.get(cacheKey) ?? null;
+        const cached = superprojectCacheMap.get(cacheKey);
+        if (isStateRootCacheEntryValid(cacheKey, cached)) {
+            superprojectCacheMap.delete(cacheKey);
+            superprojectCacheMap.set(cacheKey, cached);
+            return cached.root;
+        }
         superprojectCacheMap.delete(cacheKey);
-        superprojectCacheMap.set(cacheKey, cached);
-        return cached;
     }
     let anchor = null;
     let probeCwd = cacheKey;
@@ -177,6 +210,10 @@ function resolveSuperprojectRoot(cwd) {
                 stdio: ['pipe', 'pipe', 'pipe'],
                 windowsHide: true,
                 timeout: 5000,
+                // Force English error text so isDefinitiveNonGitError's stderr match is
+                // locale-independent (localized git output otherwise fails to match
+                // and mis-classifies a plain "not a repository" as a generic failure).
+                env: { ...process.env, LC_ALL: 'C' },
             }).trim();
         }
         catch (error) {
@@ -196,70 +233,635 @@ function resolveSuperprojectRoot(cwd) {
             if (oldest !== undefined)
                 superprojectCacheMap.delete(oldest);
         }
-        superprojectCacheMap.set(cacheKey, anchor);
+        superprojectCacheMap.set(cacheKey, createStateRootCacheEntry(cacheKey, anchor));
     }
     return anchor;
 }
+// ============================================================================
+// NON-GIT STATE ANCHORING (#3873)
+// ============================================================================
+const SENSITIVE_DIR_BASENAMES = new Set([
+    '.ssh', '.gnupg', '.aws', '.azure', '.gcloud', '.kube', 'ssh', '.pki',
+    '.config', '.claude', '.claude.json', '.codex', '.gemini', '.cursor',
+    '.vscode', '.ollama', '.docker', '.npm', '.cache', '.local',
+    'desktop', 'documents', 'downloads', 'pictures', 'photos', 'music',
+    'movies', 'videos', 'public', 'library',
+]);
+function sensitiveAbsoluteRoots() {
+    const roots = [];
+    const temp = (() => { try {
+        return resolve(tmpdir());
+    }
+    catch {
+        return null;
+    } })();
+    if (temp)
+        roots.push(temp);
+    if (process.platform === 'win32') {
+        const home = (() => { try {
+            return resolve(homedir());
+        }
+        catch {
+            return null;
+        } })();
+        roots.push('C:\\Windows', 'C:\\Program Files', 'C:\\Program Files (x86)', 'C:\\ProgramData');
+        const drive = (home && /^[a-zA-Z]:/.exec(home))?.[0];
+        if (drive)
+            roots.push(`${drive}\\Windows`, `${drive}\\Program Files`, `${drive}\\Program Files (x86)`, `${drive}\\ProgramData`);
+    }
+    else {
+        roots.push('/var', '/usr', '/etc', '/opt', '/private/var');
+    }
+    return roots;
+}
+function isFilesystemRoot(dir) {
+    return dirname(dir) === dir;
+}
+function isWithinPath(ancestor, candidate) {
+    const rel = relative(ancestor, candidate);
+    return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel));
+}
+/** Return true when state must not be anchored at this directory. */
+export function isSensitiveStateLocation(dir) {
+    let candidate;
+    try {
+        candidate = resolve(dir);
+        try {
+            candidate = realpathSync(candidate);
+        }
+        catch { /* non-existent paths retain lexical validation */ }
+    }
+    catch {
+        return true;
+    }
+    const home = (() => { try {
+        const path = resolve(homedir());
+        try {
+            return realpathSync(path);
+        }
+        catch {
+            return path;
+        }
+    }
+    catch {
+        return null;
+    } })();
+    let cursor = candidate;
+    for (;;) {
+        const name = basename(cursor);
+        const lowerName = name.toLowerCase();
+        if (home && cursor === candidate && (cursor === home || (process.platform === 'win32' && cursor.toLowerCase() === home.toLowerCase())))
+            return true;
+        if (name.startsWith('.') && name !== OmcPaths.ROOT)
+            return true;
+        if (SENSITIVE_DIR_BASENAMES.has(lowerName))
+            return true;
+        if (isFilesystemRoot(cursor))
+            break;
+        cursor = dirname(cursor);
+    }
+    if (candidate === '/tmp' || candidate === '/private/tmp')
+        return true;
+    if (isFilesystemRoot(candidate))
+        return true;
+    return sensitiveAbsoluteRoots().some((root) => {
+        const normalizedCandidate = process.platform === 'win32' ? candidate.toLowerCase() : candidate;
+        let canonicalRoot = root;
+        try {
+            canonicalRoot = realpathSync(root);
+        }
+        catch { /* missing roots retain lexical protection */ }
+        const normalizedRoot = process.platform === 'win32' ? canonicalRoot.toLowerCase() : canonicalRoot;
+        return normalizedCandidate === normalizedRoot || isWithinPath(normalizedRoot, normalizedCandidate);
+    });
+}
+function resolveNonGitFallbackRoot() {
+    const home = resolve(homedir());
+    if (isFilesystemRoot(home)) {
+        throw new Error('Cannot resolve a safe non-git OMC state root: home resolves to the filesystem root.');
+    }
+    return home;
+}
+/**
+ * Resolve the canonical state anchor for a non-git cwd.
+ * Legacy cwd-local `.omc/` trees are never adopted implicitly; callers must
+ * use the explicit migration surface to copy owner-matched session state.
+ */
+export function resolveNonGitStateAnchor(startDir) {
+    try {
+        const current = resolve(startDir || process.cwd());
+        const workspaceRoot = findWorkspaceRoot(current);
+        if (workspaceRoot && !isSensitiveStateLocation(workspaceRoot))
+            return workspaceRoot;
+        if (isSensitiveStateLocation(current))
+            return resolveNonGitFallbackRoot();
+        return resolveNonGitFallbackRoot();
+    }
+    catch {
+        return resolveNonGitFallbackRoot();
+    }
+}
 /**
  * Resolve the state-anchor root for an optional worktreeRoot argument.
- *
- * Many callers pass a raw cwd as `worktreeRoot` (e.g. hooks forwarding
- * `process.cwd()`). When that cwd is inside a git submodule we climb to the
- * outermost superproject so `.omc/` anchors to the monorepo root rather than
- * the submodule (#3349).
- *
- * Crucially, when the provided dir is NOT inside a submodule the path is used
- * VERBATIM (the historical contract) — it is NOT resolved up to its git
- * toplevel. Callers that pass an explicit directory (including tests that
- * isolate state under a per-process subdir of the repo) rely on it being the
- * literal `.omc` base; resolving such a subdir up to the repo root would
- * collapse separately-scoped state dirs into one and corrupt them.
+ * Explicit git-backed directories retain the historical literal contract;
+ * non-git directories use the stable non-git anchor.
  */
 function resolveStateAnchorRoot(worktreeRoot) {
     if (worktreeRoot)
         return resolveSuperprojectRoot(worktreeRoot) || worktreeRoot;
-    return getWorktreeRoot() || process.cwd();
+    return getWorktreeRoot() || resolveNonGitStateAnchor();
+}
+const worktreePathRenderScope = new AsyncLocalStorage();
+const projectIdentifierOperationScope = new AsyncLocalStorage();
+/** Run project-identity lookups in an operation-local memo scope. */
+export function withProjectIdentifierScope(fn) {
+    return projectIdentifierOperationScope.run(new Map(), fn);
 }
 /**
- * Get the literal git toplevel for a directory: `git rev-parse --show-toplevel`
- * with NO submodule→superproject climb. Returns null if not in a git repository.
+ * Run path lookups in an isolated render scope.
  *
- * SECURITY: this is the correct primitive for path-restriction / containment
- * checks. A tool operating inside a submodule must be confined to that submodule
- * working tree, not the parent superproject. Use this — NOT getWorktreeRoot() —
- * for boundary validation (getWorktreeRoot climbs to the superproject for state
- * anchoring and would widen the boundary across submodule borders; see #3349
- * and the Codex review on PR #3350).
+ * The memo is intentionally opt-in and is discarded when the render settles.
+ * Direct callers that enforce security boundaries continue to receive fresh
+ * probes, while each HUD render gets a new scope that observes PATH and .git
+ * metadata changes made between renders.
  */
-export function getGitTopLevel(cwd) {
-    const effectiveCwd = cwd || process.cwd();
-    // Return cached value if present (LRU: move to end on access)
-    if (toplevelCacheMap.has(effectiveCwd)) {
-        const root = toplevelCacheMap.get(effectiveCwd);
-        toplevelCacheMap.delete(effectiveCwd);
-        toplevelCacheMap.set(effectiveCwd, root);
-        return root || null;
+export function withWorktreePathRenderScope(fn) {
+    return worktreePathRenderScope.run({ gitTopLevelProbes: new Map(), projectIdentifiers: new Map() }, fn);
+}
+let gitShowToplevelProbeForTests;
+export function setGitShowToplevelProbeForTests(probe) {
+    gitShowToplevelProbeForTests = probe;
+    gitTopLevelCacheMap.clear();
+}
+function gitErrorStderr(error) {
+    if (!error || typeof error !== 'object') {
+        return '';
     }
+    const err = error;
+    if (Buffer.isBuffer(err.stderr)) {
+        return err.stderr.toString('utf8');
+    }
+    if (typeof err.stderr === 'string') {
+        return err.stderr;
+    }
+    return typeof err.message === 'string' ? err.message : '';
+}
+function isGitCommandPath(path) {
+    if (typeof path !== 'string' || path.length === 0) {
+        return false;
+    }
+    const base = basename(path);
+    return base === 'git' || base === 'git.exe' || base === 'git.cmd' || base === 'git.bat';
+}
+function isConfirmedGitExecutableNotFound(error) {
+    if (!error || typeof error !== 'object') {
+        return false;
+    }
+    const err = error;
+    if (err.code !== 'ENOENT') {
+        return false;
+    }
+    if (err.killed === true) {
+        return false;
+    }
+    if (typeof err.status === 'number') {
+        return false;
+    }
+    if (typeof err.signal === 'string' && err.signal.length > 0) {
+        return false;
+    }
+    const syscall = typeof err.syscall === 'string' ? err.syscall.toLowerCase() : '';
+    if (!syscall.includes('spawn')) {
+        return false;
+    }
+    return syscall.includes('git') || isGitCommandPath(err.path);
+}
+function isNotAGitRepositoryError(error) {
+    if (!error || typeof error !== 'object') {
+        return false;
+    }
+    const err = error;
+    if (err.code === 'ENOENT' || err.code === 'ETIMEDOUT' || err.code === 'EACCES') {
+        return false;
+    }
+    if (typeof err.signal === 'string' && err.signal.length > 0) {
+        return false;
+    }
+    const stderr = gitErrorStderr(error);
+    // A bare repository (the `git worktree` container layout: a bare `.git` at the
+    // container root with sibling linked worktrees) answers `rev-parse
+    // --show-toplevel` with exit 128 and "this operation must be run in a work
+    // tree" rather than "not a git repository". That is a benign absence of a work
+    // tree, not an unreadable git, so it must classify as not_a_repository instead
+    // of probe_failed — otherwise every fail-closed caller (HUD statusline, state
+    // resolution) throws from a legitimate container root (#3990).
+    return err.status === 128 && /(?:not a git repository|must be run in a work tree)/i.test(stderr);
+}
+/**
+ * True when `cwd` is inside a bare repository.
+ *
+ * A bare container legitimately carries a `.git` file (`gitdir: ./.bare`), so
+ * the `.git`-present guards below cannot treat its presence as evidence of a
+ * broken or foreign repository. Any failure to answer is reported as not bare,
+ * which keeps those guards fail-closed by default.
+ */
+function isBareRepository(cwd) {
     try {
-        const root = execFileSync('git', ['rev-parse', '--show-toplevel'], {
-            cwd: effectiveCwd,
+        return (execFileSync('git', ['rev-parse', '--is-bare-repository'], {
+            cwd,
             encoding: 'utf-8',
             stdio: ['pipe', 'pipe', 'pipe'],
             windowsHide: true,
             timeout: 5000,
-        }).trim();
-        if (toplevelCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
-            const oldest = toplevelCacheMap.keys().next().value;
-            if (oldest !== undefined)
-                toplevelCacheMap.delete(oldest);
-        }
-        toplevelCacheMap.set(effectiveCwd, root);
-        return root;
+            env: { ...process.env, LC_ALL: 'C' },
+        }).trim() === 'true');
     }
     catch {
-        // Not in a git repository - do NOT cache so a later git init re-detects.
+        return false;
+    }
+}
+function formatGitProbeDetail(error) {
+    if (!error || typeof error !== 'object') {
+        return String(error);
+    }
+    const err = error;
+    if (err.code === 'ENOENT') {
+        return 'git executable not found';
+    }
+    if (err.code === 'EACCES') {
+        return 'git executable not accessible';
+    }
+    if (err.code === 'ETIMEDOUT' || err.killed === true) {
+        return 'git probe timed out';
+    }
+    if (typeof err.signal === 'string' && err.signal.length > 0) {
+        return `git killed by ${err.signal}`;
+    }
+    const stderr = gitErrorStderr(error).trim();
+    if (stderr.length > 0) {
+        return stderr.split('\n')[0] ?? stderr;
+    }
+    if (typeof err.message === 'string' && err.message.length > 0) {
+        return err.message;
+    }
+    if (typeof err.status === 'number') {
+        return `git exited ${err.status}`;
+    }
+    return 'unknown git probe failure';
+}
+export function findGitMetadataDir(start) {
+    let current = start;
+    for (;;) {
+        if (existsSync(join(current, '.git'))) {
+            return current;
+        }
+        const parent = dirname(current);
+        if (parent === current) {
+            return null;
+        }
+        current = parent;
+    }
+}
+function expandPathForCompare(path) {
+    const normalized = resolve(path);
+    try {
+        return realpathSync.native(normalized);
+    }
+    catch {
+        try {
+            return realpathSync(normalized);
+        }
+        catch {
+            return null;
+        }
+    }
+}
+function canonicalizeExistingPath(path) {
+    try {
+        return realpathSync(resolve(path));
+    }
+    catch {
         return null;
     }
+}
+function sameCanonicalPath(left, right) {
+    const a = expandPathForCompare(left);
+    const b = expandPathForCompare(right);
+    if (!a || !b) {
+        return false;
+    }
+    if (a === b) {
+        return true;
+    }
+    if (process.platform !== 'win32') {
+        return false;
+    }
+    const fold = (value) => value.replaceAll('/', '\\').toLowerCase();
+    return fold(a) === fold(b);
+}
+function isCredibleGitWorktreeRoot(root) {
+    try {
+        if (!statSync(root).isDirectory()) {
+            return false;
+        }
+    }
+    catch {
+        return false;
+    }
+    const rootReal = canonicalizeExistingPath(root);
+    if (!rootReal) {
+        return false;
+    }
+    const metadataDir = findGitMetadataDir(rootReal);
+    return metadataDir !== null && sameCanonicalPath(metadataDir, rootReal);
+}
+function classifyGitShowToplevelStdout(stdout, cwd) {
+    const root = stdout.trim();
+    if (root.length === 0 || !isAbsolute(root) || !isCredibleGitWorktreeRoot(root)) {
+        return { status: 'probe_failed', detail: 'malformed git toplevel output' };
+    }
+    const cwdReal = canonicalizeExistingPath(cwd);
+    if (!cwdReal) {
+        return { status: 'probe_failed', detail: 'malformed git toplevel output' };
+    }
+    const metadataDir = findGitMetadataDir(cwdReal);
+    if (!metadataDir || !sameCanonicalPath(metadataDir, root)) {
+        return { status: 'probe_failed', detail: 'malformed git toplevel output' };
+    }
+    return { status: 'ok', root: canonicalizeExistingPath(metadataDir) ?? metadataDir };
+}
+function classifyGitShowToplevelError(error) {
+    if (isNotAGitRepositoryError(error)) {
+        return { status: 'not_a_repository' };
+    }
+    if (isConfirmedGitExecutableNotFound(error)) {
+        return { status: 'git_missing' };
+    }
+    return { status: 'probe_failed', detail: formatGitProbeDetail(error) };
+}
+function runGitShowToplevel(cwd) {
+    if (gitShowToplevelProbeForTests) {
+        const result = gitShowToplevelProbeForTests(cwd);
+        return Buffer.isBuffer(result) ? result.toString('utf8') : result;
+    }
+    return execFileSync('git', ['rev-parse', '--show-toplevel'], {
+        cwd,
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+        timeout: 5000,
+        // Force English error text so isNotAGitRepositoryError's stderr match is
+        // locale-independent (localized git output otherwise fails to match and
+        // mis-classifies a plain "not a repository" as probe_failed, which then
+        // fails closed and breaks callers such as the HUD statusline).
+        env: { ...process.env, LC_ALL: 'C' },
+    });
+}
+export function probeGitTopLevel(cwd) {
+    const scope = worktreePathRenderScope.getStore();
+    const scopeKey = scope ? canonicalizeExistingPath(cwd) ?? resolve(cwd) : null;
+    if (scope && scopeKey) {
+        const cached = scope.gitTopLevelProbes.get(scopeKey);
+        if (cached)
+            return cached;
+    }
+    // Outside an explicit render scope, never cache security decisions: PATH,
+    // the git executable, and .git metadata can change between calls in the same
+    // process. A HUD render scope is intentionally limited to one invocation.
+    let result;
+    try {
+        result = classifyGitShowToplevelStdout(runGitShowToplevel(cwd), cwd);
+    }
+    catch (error) {
+        result = classifyGitShowToplevelError(error);
+    }
+    if (scope && scopeKey) {
+        scope.gitTopLevelProbes.set(scopeKey, result);
+    }
+    return result;
+}
+function gitMetadataFileSignature(path) {
+    try {
+        const metadata = statSync(path);
+        return [
+            path,
+            metadata.dev,
+            metadata.ino,
+            metadata.mode,
+            metadata.size,
+            metadata.mtimeMs,
+            metadata.ctimeMs,
+        ].join(':');
+    }
+    catch {
+        return `${path}:missing`;
+    }
+}
+function readGitMarker(path) {
+    let descriptor;
+    try {
+        if (!lstatSync(path).isFile())
+            return null;
+        descriptor = openSync(path, 'r');
+        const buffer = Buffer.alloc(MAX_GIT_MARKER_BYTES);
+        const bytesRead = readSync(descriptor, buffer, 0, buffer.length, 0);
+        return buffer.toString('utf8', 0, bytesRead);
+    }
+    catch {
+        return null;
+    }
+    finally {
+        if (descriptor !== undefined)
+            closeSync(descriptor);
+    }
+}
+function commonGitDirectorySignature(linkedGitDir) {
+    const commondirPath = join(linkedGitDir, 'commondir');
+    try {
+        if (!existsSync(commondirPath))
+            return `${commondirPath}:absent`;
+        const marker = readGitMarker(commondirPath);
+        if (marker === null)
+            return `${commondirPath}:unreadable`;
+        const commonDir = canonicalizeExistingPath(resolve(linkedGitDir, marker.trim()));
+        if (!commonDir || !statSync(commonDir).isDirectory()) {
+            return `${commondirPath}:invalid:${marker}`;
+        }
+        return [
+            commonDir,
+            gitMetadataFileSignature(commonDir),
+            gitMetadataFileSignature(join(commonDir, 'HEAD')),
+            gitMetadataFileSignature(join(commonDir, 'index')),
+            gitMetadataFileSignature(join(commonDir, 'config')),
+        ].join(':');
+    }
+    catch {
+        return `${commondirPath}:invalid`;
+    }
+}
+function getGitMetadataSnapshot(cwd) {
+    const metadataDir = findGitMetadataDir(canonicalizeExistingPath(cwd) ?? resolve(cwd));
+    if (!metadataDir)
+        return null;
+    const canonicalDirectory = canonicalizeExistingPath(metadataDir);
+    if (!canonicalDirectory)
+        return null;
+    const gitPath = join(canonicalDirectory, '.git');
+    try {
+        const metadata = statSync(gitPath);
+        const marker = metadata.isFile() ? readGitMarker(gitPath) : '';
+        if (marker === null)
+            return null;
+        let metadataPath = gitPath;
+        let linkedGitDirSignature = '';
+        if (metadata.isFile()) {
+            const gitDirMatch = /^\s*gitdir:\s*(.+?)\s*$/im.exec(marker);
+            if (!gitDirMatch?.[1])
+                return null;
+            const linkedGitDir = resolve(canonicalDirectory, gitDirMatch[1].trim());
+            const linkedGitDirReal = canonicalizeExistingPath(linkedGitDir);
+            if (!linkedGitDirReal || !statSync(linkedGitDirReal).isDirectory())
+                return null;
+            metadataPath = linkedGitDirReal;
+            linkedGitDirSignature = [
+                linkedGitDirReal,
+                gitMetadataFileSignature(linkedGitDirReal),
+                gitMetadataFileSignature(join(linkedGitDirReal, 'HEAD')),
+                gitMetadataFileSignature(join(linkedGitDirReal, 'index')),
+                gitMetadataFileSignature(join(linkedGitDirReal, 'config')),
+                gitMetadataFileSignature(join(linkedGitDirReal, 'config.worktree')),
+                gitMetadataFileSignature(join(linkedGitDirReal, 'commondir')),
+                gitMetadataFileSignature(join(linkedGitDirReal, 'gitdir')),
+                commonGitDirectorySignature(linkedGitDirReal),
+            ].join(':');
+        }
+        const gitPathReal = canonicalizeExistingPath(gitPath) ?? resolve(gitPath);
+        const metadataPathReal = canonicalizeExistingPath(metadataPath) ?? resolve(metadataPath);
+        const signature = [
+            gitPathReal,
+            gitMetadataFileSignature(gitPath),
+            marker,
+            linkedGitDirSignature,
+            metadataPathReal,
+            gitMetadataFileSignature(join(metadataPathReal, 'HEAD')),
+            gitMetadataFileSignature(join(metadataPathReal, 'index')),
+            gitMetadataFileSignature(join(metadataPathReal, 'config')),
+            gitMetadataFileSignature(join(metadataPathReal, 'config.worktree')),
+        ].join(':');
+        return { directory: canonicalDirectory, signature };
+    }
+    catch {
+        return null;
+    }
+}
+function getGitTopologySignature(cwd) {
+    const start = canonicalizeExistingPath(cwd) ?? resolve(cwd);
+    const signatures = [];
+    let cursor = start;
+    for (;;) {
+        const gitPath = join(cursor, '.git');
+        if (existsSync(gitPath)) {
+            let metadataPath = gitPath;
+            let marker = '';
+            try {
+                if (statSync(gitPath).isFile()) {
+                    marker = readGitMarker(gitPath) ?? '<unreadable>';
+                    const gitDirMatch = /^\s*gitdir:\s*(.+?)\s*$/im.exec(marker);
+                    if (gitDirMatch?.[1])
+                        metadataPath = resolve(cursor, gitDirMatch[1].trim());
+                }
+            }
+            catch {
+                // The path signature below records an unreadable or replaced marker.
+            }
+            const metadataReal = canonicalizeExistingPath(metadataPath) ?? resolve(metadataPath);
+            signatures.push([
+                cursor,
+                gitMetadataFileSignature(gitPath),
+                marker,
+                gitMetadataFileSignature(join(metadataReal, 'HEAD')),
+                gitMetadataFileSignature(join(metadataReal, 'index')),
+                gitMetadataFileSignature(join(metadataReal, 'config')),
+                gitMetadataFileSignature(join(metadataReal, 'config.worktree')),
+                commonGitDirectorySignature(metadataReal),
+            ].join(':'));
+        }
+        const parent = dirname(cursor);
+        if (parent === cursor)
+            break;
+        cursor = parent;
+    }
+    return signatures.join('|');
+}
+function createStateRootCacheEntry(cwd, root) {
+    return {
+        root,
+        metadataSignature: getGitMetadataSnapshot(cwd)?.signature ?? null,
+        topologySignature: getGitTopologySignature(cwd),
+        environmentSignature: gitProbeEnvironmentSignature(),
+    };
+}
+function isStateRootCacheEntryValid(cwd, entry) {
+    return (entry.metadataSignature === (getGitMetadataSnapshot(cwd)?.signature ?? null) &&
+        entry.topologySignature === getGitTopologySignature(cwd) &&
+        entry.environmentSignature === gitProbeEnvironmentSignature());
+}
+function isGitTopLevelCacheEntryValid(cwd, cached) {
+    const current = getGitMetadataSnapshot(cwd);
+    if (!current || current.signature !== cached.metadataSignature)
+        return false;
+    if (cached.topologySignature !== getGitTopologySignature(cwd))
+        return false;
+    if (cached.environmentSignature !== gitProbeEnvironmentSignature())
+        return false;
+    if (!sameCanonicalPath(current.directory, cached.metadataDir))
+        return false;
+    if (!sameCanonicalPath(current.directory, cached.root))
+        return false;
+    return isCredibleGitWorktreeRoot(cached.root);
+}
+function cacheGitTopLevel(key, root, cwd) {
+    const metadata = getGitMetadataSnapshot(cwd);
+    if (!metadata || !sameCanonicalPath(metadata.directory, root))
+        return;
+    if (gitTopLevelCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
+        const oldest = gitTopLevelCacheMap.keys().next().value;
+        if (oldest !== undefined)
+            gitTopLevelCacheMap.delete(oldest);
+    }
+    gitTopLevelCacheMap.set(key, {
+        root,
+        metadataDir: metadata.directory,
+        metadataSignature: metadata.signature,
+        topologySignature: getGitTopologySignature(cwd),
+        environmentSignature: gitProbeEnvironmentSignature(),
+    });
+}
+/**
+ * Resolve a literal Git top-level with positive, metadata-validated caching.
+ * Security-sensitive containment decisions must call probeGitTopLevel() instead.
+ */
+export function getGitTopLevel(cwd) {
+    const effectiveCwd = cwd || process.cwd();
+    const key = canonicalizeExistingPath(effectiveCwd) ?? resolve(effectiveCwd);
+    const cached = gitTopLevelCacheMap.get(key);
+    if (cached) {
+        if (isGitTopLevelCacheEntryValid(effectiveCwd, cached)) {
+            gitTopLevelCacheMap.delete(key);
+            gitTopLevelCacheMap.set(key, cached);
+            return cached.root;
+        }
+        gitTopLevelCacheMap.delete(key);
+    }
+    const probe = probeGitTopLevel(effectiveCwd);
+    if (probe.status !== 'ok')
+        return null;
+    cacheGitTopLevel(key, probe.root, effectiveCwd);
+    return probe.root;
+}
+function formatGitProbeFailedMessage(workingDirectory) {
+    return (`workingDirectory '${workingDirectory}' git probe failed and was not used. ` +
+        `Cross-repository access is not permitted; pass a path inside the current repository or start the session there.`);
 }
 /**
  * Get the state-anchor "worktree root" for a directory.
@@ -272,17 +874,22 @@ export function getGitTopLevel(cwd) {
  *
  * SECURITY: do NOT use this for path-restriction / containment checks — the
  * submodule climb widens the boundary across submodule borders. Use
- * getGitTopLevel() for confinement.
+ * probeGitTopLevel() for confinement.
  */
 export function getWorktreeRoot(cwd) {
     const effectiveCwd = cwd || process.cwd();
     // Return cached value if present (LRU: move to end on access)
     if (worktreeCacheMap.has(effectiveCwd)) {
-        const root = worktreeCacheMap.get(effectiveCwd);
-        // Refresh insertion order for LRU eviction
+        const cached = worktreeCacheMap.get(effectiveCwd);
+        if (isStateRootCacheEntryValid(effectiveCwd, cached) &&
+            cached.root !== null &&
+            isCredibleGitWorktreeRoot(cached.root)) {
+            // Refresh insertion order for LRU eviction
+            worktreeCacheMap.delete(effectiveCwd);
+            worktreeCacheMap.set(effectiveCwd, cached);
+            return cached.root;
+        }
         worktreeCacheMap.delete(effectiveCwd);
-        worktreeCacheMap.set(effectiveCwd, root);
-        return root || null;
     }
     // Prefer the superproject working tree when cwd is inside a submodule (#3349);
     // otherwise the literal git toplevel.
@@ -299,7 +906,7 @@ export function getWorktreeRoot(cwd) {
             worktreeCacheMap.delete(oldest);
         }
     }
-    worktreeCacheMap.set(effectiveCwd, root);
+    worktreeCacheMap.set(effectiveCwd, createStateRootCacheEntry(effectiveCwd, root));
     return root;
 }
 /**
@@ -323,6 +930,41 @@ export function validatePath(inputPath) {
 // ============================================================================
 /** Track which dual-dir warnings have been logged to avoid repeated warnings */
 const dualDirWarnings = new Set();
+/**
+ * Best-effort discovery of a centralized state location from Claude Code
+ * settings.json `env` blocks. This is used only for the symmetric legacy-branch
+ * warning — it never influences which root is chosen. Shell rc files are not
+ * sourced by GUI-launched editors, but settings.json `env` does reach hook and
+ * statusline subprocesses (verified). If discovery fails the legacy branch
+ * simply stays silent for this pair, the same as before.
+ */
+function discoverCentralizedDirFromSettings() {
+    const candidates = [];
+    try {
+        candidates.push(join(getClaudeConfigDir(), 'settings.json'));
+    }
+    catch { /* ignore */ }
+    // Project-local settings override the user one — check both.
+    // Best-effort: try cwd-adjacent .claude/settings.json even if worktreeRoot varies.
+    try {
+        const cw = process.cwd();
+        candidates.push(join(cw, '.claude', 'settings.json'));
+        candidates.push(join(cw, '.claude', 'settings.local.json'));
+    }
+    catch { /* ignore */ }
+    for (const p of candidates) {
+        try {
+            const raw = readFileSync(p, 'utf-8');
+            const parsed = JSON.parse(raw);
+            const env = parsed?.env;
+            const val = env?.OMC_STATE_DIR;
+            if (typeof val === 'string' && val.trim())
+                return val.trim();
+        }
+        catch { /* malformed or missing — ignore */ }
+    }
+    return null;
+}
 /** Track which workspace anchors have already had sibling-scan warnings emitted (once per process) */
 const siblingRetrofitWarned = new Set();
 /**
@@ -445,6 +1087,20 @@ export function getProjectIdentifier(worktreeRoot) {
     // submodule still resolves the submodule's own identity, and findWorkspaceRoot
     // below sees the unclimbed root so an inner `.omc-workspace` marker is honored.
     const root = worktreeRoot || getGitTopLevel() || process.cwd();
+    const operationScope = projectIdentifierOperationScope.getStore();
+    const operationScopeKey = operationScope ? canonicalizeExistingPath(root) ?? resolve(root) : null;
+    if (operationScope && operationScopeKey) {
+        const cached = operationScope.get(operationScopeKey);
+        if (cached !== undefined)
+            return cached;
+    }
+    const scope = worktreePathRenderScope.getStore();
+    const scopeKey = scope ? canonicalizeExistingPath(root) ?? resolve(root) : null;
+    if (scope && scopeKey) {
+        const cached = scope.projectIdentifiers.get(scopeKey);
+        if (cached !== undefined)
+            return cached;
+    }
     // Workspace marker can supply a stable, user-controlled identifier.
     // This wins over git remote so multi-repo workspaces have one consistent ID.
     const workspaceRoot = findWorkspaceRoot(root);
@@ -453,27 +1109,37 @@ export function getProjectIdentifier(worktreeRoot) {
         if (cfg.id && typeof cfg.id === 'string' && cfg.id.trim()) {
             const safeId = cfg.id.trim().replace(/[^a-zA-Z0-9_-]/g, '_');
             const hash = createHash('sha256').update(safeId).digest('hex').slice(0, 16);
-            return `${safeId}-${hash}`;
+            const identifier = `${safeId}-${hash}`;
+            if (operationScope && operationScopeKey)
+                operationScope.set(operationScopeKey, identifier);
+            if (scope && scopeKey)
+                scope.projectIdentifiers.set(scopeKey, identifier);
+            return identifier;
         }
         // No explicit id — derive a stable identifier from the workspace path so
         // sibling subrepos inside the same workspace share one ID.
         const hash = createHash('sha256').update(workspaceRoot).digest('hex').slice(0, 16);
         const dirName = basename(workspaceRoot).replace(/[^a-zA-Z0-9_-]/g, '_');
-        return `${dirName}-${hash}`;
+        const identifier = `${dirName}-${hash}`;
+        if (operationScope && operationScopeKey)
+            operationScope.set(operationScopeKey, identifier);
+        if (scope && scopeKey)
+            scope.projectIdentifiers.set(scopeKey, identifier);
+        return identifier;
     }
-    let source;
+    let remoteUrl = '';
     try {
-        const remoteUrl = execFileSync('git', ['remote', 'get-url', 'origin'], {
+        remoteUrl = execFileSync('git', ['remote', 'get-url', 'origin'], {
             cwd: root,
             encoding: 'utf-8',
             stdio: ['pipe', 'pipe', 'pipe'],
             windowsHide: true,
+            timeout: 5000,
         }).trim();
-        source = remoteUrl || root;
     }
     catch {
-        // No git remote (local-only repo or not a git repo) — use path
-        source = root;
+        // No git remote (local-only repo or not a git repo) — use the normalized
+        // repository identity below.
     }
     // For linked worktrees (created via `git worktree add`), resolve to the
     // primary repository root so all worktrees of the same repo produce the
@@ -506,9 +1172,15 @@ export function getProjectIdentifier(worktreeRoot) {
     catch {
         // Not a git repo or command failed — fall back to worktree root
     }
+    const source = remoteUrl || primaryRoot;
     const hash = createHash('sha256').update(source).digest('hex').slice(0, 16);
     const dirName = basename(primaryRoot).replace(/[^a-zA-Z0-9_-]/g, '_');
-    return `${dirName}-${hash}`;
+    const identifier = `${dirName}-${hash}`;
+    if (operationScope && operationScopeKey)
+        operationScope.set(operationScopeKey, identifier);
+    if (scope && scopeKey)
+        scope.projectIdentifiers.set(scopeKey, identifier);
+    return identifier;
 }
 /**
  * Get the .omc root directory path.
@@ -530,7 +1202,9 @@ export function getOmcRoot(worktreeRoot) {
         // an explicit worktreeRoot keeps its own centralized id rather than merging
         // into the parent project's (preserves submodule identity).
         const root = worktreeRoot || getGitTopLevel() || process.cwd();
-        const projectId = getProjectIdentifier(root);
+        const workspaceRoot = findWorkspaceRoot(root);
+        const gitTopLevel = getGitTopLevel(root);
+        const projectId = !gitTopLevel && !workspaceRoot ? 'non-git' : getProjectIdentifier(root);
         const centralizedPath = join(customDir, projectId);
         // Log notice if both legacy .omc/ and new centralized dir exist
         const legacyPath = join(root, OmcPaths.ROOT);
@@ -546,10 +1220,57 @@ export function getOmcRoot(worktreeRoot) {
     // workspaces where the parent dir is not itself a git repo: all sub-repos
     // share the same .omc/ at the marker location.
     const workspaceAnchor = findWorkspaceRoot(worktreeRoot);
-    if (workspaceAnchor) {
+    if (workspaceAnchor && !isSensitiveStateLocation(workspaceAnchor)) {
+        // Symmetric diagnostic: the legacy branch was previously silent.
+        // If a centralized sibling already exists (best-effort discovery via
+        // settings.json `env`), warn so the misconfigured half is visible.
+        try {
+            const legacyPathW = join(workspaceAnchor, OmcPaths.ROOT);
+            const discoveredCentral = discoverCentralizedDirFromSettings();
+            if (discoveredCentral) {
+                const wsCfg = readWorkspaceMarkerConfig(workspaceAnchor);
+                let projectIdW;
+                if (wsCfg.id && typeof wsCfg.id === 'string' && wsCfg.id.trim()) {
+                    const safeId = wsCfg.id.trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+                    projectIdW = `${safeId}-${createHash('sha256').update(safeId).digest('hex').slice(0, 16)}`;
+                }
+                else {
+                    projectIdW = `${basename(workspaceAnchor).replace(/[^a-zA-Z0-9_-]/g, '_')}-${createHash('sha256').update(workspaceAnchor).digest('hex').slice(0, 16)}`;
+                }
+                const centralizedPathW = join(discoveredCentral, projectIdW);
+                const warningKeyW = `${legacyPathW}:${centralizedPathW}`;
+                if (!dualDirWarnings.has(warningKeyW) && existsSync(legacyPathW) && existsSync(centralizedPathW)) {
+                    dualDirWarnings.add(warningKeyW);
+                    console.warn(`[omc] Both legacy state dir (${legacyPathW}) and centralized state dir (${centralizedPathW}) exist. ` +
+                        `Using legacy dir (OMC_STATE_DIR not set in this process). Set OMC_STATE_DIR via settings.json env to use centralized dir consistently.`);
+                }
+            }
+        }
+        catch { /* best-effort diagnostic only — never break resolution */ }
         return join(workspaceAnchor, OmcPaths.ROOT);
     }
     const root = resolveStateAnchorRoot(worktreeRoot);
+    if (!getGitTopLevel(root)) {
+        return join(resolveNonGitStateAnchor(root), OmcPaths.ROOT);
+    }
+    // Symmetric diagnostic for git-anchored projects: the legacy branch was
+    // previously silent. If a centralized sibling already exists (discoverable
+    // via settings.json `env`), warn so the misconfigured half is visible.
+    try {
+        const legacyPath = join(root, OmcPaths.ROOT);
+        const discoveredCentral = discoverCentralizedDirFromSettings();
+        if (discoveredCentral) {
+            const projectId = getProjectIdentifier(root);
+            const centralizedPath = join(discoveredCentral, projectId);
+            const warningKey = `${legacyPath}:${centralizedPath}`;
+            if (!dualDirWarnings.has(warningKey) && existsSync(legacyPath) && existsSync(centralizedPath)) {
+                dualDirWarnings.add(warningKey);
+                console.warn(`[omc] Both legacy state dir (${legacyPath}) and centralized state dir (${centralizedPath}) exist. ` +
+                    `Using legacy dir (OMC_STATE_DIR not set in this process). Set OMC_STATE_DIR via settings.json env to use centralized dir consistently.`);
+            }
+        }
+    }
+    catch { /* best-effort diagnostic only */ }
     return join(root, OmcPaths.ROOT);
 }
 /**
@@ -691,7 +1412,7 @@ export function ensureAllOmcDirs(worktreeRoot) {
  */
 export function clearWorktreeCache() {
     worktreeCacheMap.clear();
-    toplevelCacheMap.clear();
+    gitTopLevelCacheMap.clear();
     superprojectCacheMap.clear();
     workspaceCacheMap.clear();
 }
@@ -1026,6 +1747,7 @@ export function resolveTranscriptPath(transcriptPath, cwd) {
             encoding: 'utf-8',
             stdio: ['pipe', 'pipe', 'pipe'],
             windowsHide: true,
+            timeout: 5000,
         }).trim();
         const absoluteCommonDir = resolve(effectiveCwd, gitCommonDir);
         // For linked worktrees, git-common-dir is <repo>/.git/worktrees/<name>
@@ -1045,6 +1767,7 @@ export function resolveTranscriptPath(transcriptPath, cwd) {
             encoding: 'utf-8',
             stdio: ['pipe', 'pipe', 'pipe'],
             windowsHide: true,
+            timeout: 5000,
         }).trim();
         if (mainRepoRoot !== worktreeTop) {
             // basename handles `\` (Windows transcript_path) and `/` (POSIX).
@@ -1068,6 +1791,88 @@ export function resolveTranscriptPath(transcriptPath, cwd) {
     return transcriptPath;
 }
 /**
+ * Caller-visible workingDirectory labels for rejection errors (#3858).
+ * Retain the original caller-supplied string; never substitute realpath.
+ * Trusted root is basename-only so the full host path is not disclosed.
+ */
+function callerVisibleTrustedRootLabel(trustedRoot) {
+    const label = basename(trustedRoot);
+    return label.length > 0 ? label : 'current repository';
+}
+function formatOutsideTrustedRootMessage(workingDirectory, trustedRoot) {
+    return (`workingDirectory '${workingDirectory}' ` +
+        `is outside the trusted worktree root '${callerVisibleTrustedRootLabel(trustedRoot)}'.`);
+}
+function attachCanonicalWorkingDirectoryRoots(target, providedRoot, trustedRoot) {
+    canonicalWorkingDirectoryRoots.set(target, { providedRoot, trustedRoot });
+}
+export function getCanonicalWorkingDirectoryRoots(target) {
+    const roots = canonicalWorkingDirectoryRoots.get(target);
+    if (!roots) {
+        throw new Error('canonical working directory roots are not attached');
+    }
+    return roots;
+}
+function canonicalRootAliases(root) {
+    if (root.length === 0) {
+        return [];
+    }
+    const aliases = new Set([root]);
+    try {
+        aliases.add(pathToFileURL(root).href);
+    }
+    catch {
+        // Ignore roots that cannot be represented as file URLs.
+    }
+    try {
+        const real = realpathSync(root);
+        aliases.add(real);
+        aliases.add(pathToFileURL(real).href);
+    }
+    catch {
+        // Root may not exist on disk (synthetic test paths).
+    }
+    if (sep === '\\') {
+        aliases.add(root.replaceAll('\\', '/'));
+    }
+    return [...aliases].sort((a, b) => b.length - a.length);
+}
+function redactCanonicalRoots(text, providedRoot, trustedRoot) {
+    let redacted = text;
+    const roots = [...canonicalRootAliases(providedRoot), ...canonicalRootAliases(trustedRoot)]
+        .sort((a, b) => b.length - a.length);
+    for (const root of roots) {
+        redacted = redacted.split(root).join('<redacted>');
+    }
+    return redacted;
+}
+function redactErrorStack(stack, providedRoot, trustedRoot) {
+    const newline = stack.includes('\r\n') ? '\r\n' : '\n';
+    const lines = stack.split(/\r?\n/);
+    if (lines.length <= 1) {
+        return stack;
+    }
+    const [header, ...frames] = lines;
+    return [header, ...frames.map((frame) => redactCanonicalRoots(frame, providedRoot, trustedRoot))].join(newline);
+}
+function foreignRepositoryResolution(providedRoot, trustedRoot, callerLabel) {
+    const resolution = {
+        status: 'foreign_repository',
+        callerLabel,
+    };
+    attachCanonicalWorkingDirectoryRoots(resolution, providedRoot, trustedRoot);
+    Object.defineProperty(resolution, 'toJSON', {
+        enumerable: false,
+        writable: false,
+        configurable: false,
+        value: () => ({
+            status: 'foreign_repository',
+            callerLabel,
+        }),
+    });
+    return resolution;
+}
+/**
  * Validate that a workingDirectory is within the trusted git top-level.
  * The trusted root is derived from process.cwd(), NOT from user input.
  *
@@ -1080,7 +1885,11 @@ export function resolveTranscriptPath(transcriptPath, cwd) {
  * @throws Error if workingDirectory is outside trusted root
  */
 export function validateWorkingDirectory(workingDirectory) {
-    const trustedRoot = getGitTopLevel(process.cwd()) || process.cwd();
+    const trustedProbe = probeGitTopLevel(process.cwd());
+    if (trustedProbe.status === 'probe_failed' || trustedProbe.status === 'git_missing') {
+        throw new Error(formatGitProbeFailedMessage(process.cwd()));
+    }
+    const trustedRoot = trustedProbe.status === 'ok' ? trustedProbe.root : process.cwd();
     if (!workingDirectory) {
         return trustedRoot;
     }
@@ -1094,9 +1903,10 @@ export function validateWorkingDirectory(workingDirectory) {
         trustedRootReal = trustedRoot;
     }
     // Try to resolve the provided directory to its literal git top-level.
-    const providedRoot = getGitTopLevel(resolved);
-    if (providedRoot) {
+    const providedProbe = probeGitTopLevel(resolved);
+    if (providedProbe.status === 'ok') {
         // Git resolution succeeded — require exact worktree identity.
+        const providedRoot = providedProbe.root;
         let providedRootReal;
         try {
             providedRootReal = realpathSync(providedRoot);
@@ -1114,7 +1924,10 @@ export function validateWorkingDirectory(workingDirectory) {
         }
         return providedRoot;
     }
-    // Git resolution failed (lock contention, env issues, non-repo dir).
+    if (providedProbe.status === 'probe_failed' || providedProbe.status === 'git_missing') {
+        throw new Error(formatGitProbeFailedMessage(workingDirectory));
+    }
+    // Git resolution found a non-repository directory.
     // Validate that the raw directory is under the trusted root before falling
     // back — otherwise reject it as truly outside (#576).
     let resolvedReal;
@@ -1126,11 +1939,43 @@ export function validateWorkingDirectory(workingDirectory) {
     }
     const rel = relative(trustedRootReal, resolvedReal);
     if (rel.startsWith('..') || isAbsolute(rel)) {
-        throw new Error(`workingDirectory '${workingDirectory}' is outside the trusted worktree root '${trustedRoot}'.`);
+        throw new Error(formatOutsideTrustedRootMessage(workingDirectory, trustedRoot));
     }
-    // Directory is under trusted root but git failed — return trusted root,
-    // never the subdirectory, to prevent .omc/ creation in subdirs (#576).
-    return trustedRoot;
+    if (trustedRootReal === resolvedReal) {
+        return trustedRoot;
+    }
+    // Git-backed sessions still normalize subdirectories to the repository
+    // root. A git-less session has no repository root to normalize to, so keep
+    // the explicitly requested directory; getOmcRoot() applies the stable
+    // non-git anchor and prevents a per-directory .omc/ from being created.
+    if (trustedProbe.status === 'ok') {
+        return trustedRoot;
+    }
+    return resolvedReal;
+}
+/**
+ * Resolve a state-tool workingDirectory with visible repository-boundary
+ * failures. Git sessions may target the same repository or a linked worktree;
+ * git-less sessions retain an explicit child directory while still rejecting
+ * paths outside the trusted non-git context.
+ */
+export function resolveStateWorkingDirectory(workingDirectory) {
+    const currentProbe = probeGitTopLevel(process.cwd());
+    if (currentProbe.status === 'probe_failed' || currentProbe.status === 'git_missing') {
+        throw new Error(formatGitProbeFailedMessage(process.cwd()));
+    }
+    if (currentProbe.status === 'ok') {
+        if (!workingDirectory)
+            return validateWorkingDirectoryOrLinkedWorktree();
+        return validateWorkingDirectoryOrLinkedWorktree(workingDirectory);
+    }
+    if (!workingDirectory)
+        return process.cwd();
+    // Run the strict resolver first so a mixed git/non-git or foreign-repository
+    // request cannot be silently substituted with the startup cwd.
+    validateWorkingDirectoryOrLinkedWorktree(workingDirectory);
+    const validated = validateWorkingDirectory(workingDirectory);
+    return validated;
 }
 function getGitCommonDir(cwd) {
     try {
@@ -1148,20 +1993,78 @@ function getGitCommonDir(cwd) {
     }
 }
 /**
- * Validate a workingDirectory while permitting linked git worktrees for the
- * same repository.
+ * Typed error thrown when a workingDirectory resolves to a different git
+ * repository than the trusted startup repository. The rejection must reach the
+ * tool caller; it is never silently substituted (#3858).
  *
- * This preserves validateWorkingDirectory's default cwd behavior and its
- * same-root/subdirectory normalization, but allows a per-call directory to
- * resolve to a sibling manual `git worktree` when both worktrees share the
- * same git common directory. Other unrelated git repositories still fall back
- * to the trusted startup cwd, and non-repo paths outside the trusted root are
- * rejected.
+ * `.message` is the caller-visible contract: the original workingDirectory
+ * label plus a basename-only trusted-root identity. Canonical roots are
+ * WeakMap-only internal diagnostics. `callerLabel` is required and enumerable.
  */
-export function validateWorkingDirectoryOrLinkedWorktree(workingDirectory) {
-    const trustedRoot = getGitTopLevel(process.cwd()) || process.cwd();
+export class ForeignWorkingDirectoryError extends Error {
+    callerLabel;
+    constructor(providedRoot, trustedRoot, callerLabel) {
+        super(`workingDirectory '${callerLabel}' belongs to a different repository than '${callerVisibleTrustedRootLabel(trustedRoot)}' and was not used. ` +
+            `Cross-repository access is not permitted; pass a path inside the current repository or start the session there.`);
+        this.name = 'ForeignWorkingDirectoryError';
+        this.callerLabel = callerLabel;
+        attachCanonicalWorkingDirectoryRoots(this, providedRoot, trustedRoot);
+        Object.defineProperty(this, 'stack', {
+            value: redactErrorStack(this.stack ?? `${this.name}: ${this.message}`, providedRoot, trustedRoot),
+            enumerable: false,
+            configurable: true,
+            writable: true,
+        });
+    }
+    toJSON() {
+        return {
+            name: this.name,
+            message: this.message,
+            callerLabel: this.callerLabel,
+        };
+    }
+    [Symbol.for('nodejs.util.inspect.custom')]() {
+        return this.stack ?? `${this.name}: ${this.message}`;
+    }
+}
+/**
+ * Resolve a workingDirectory while permitting linked git worktrees for the same
+ * repository, returning a typed result (#3858).
+ *
+ * Same-root and linked-worktree (shared git common directory) directories
+ * resolve to `ok` with the provided root. A directory inside a *different* git
+ * repository resolves to `foreign_repository` — callers must reject it
+ * visibly. Non-repo paths outside the trusted root are rejected by throwing,
+ * matching validateWorkingDirectory. Generic git-probe failures (anything other
+ * than confirmed executable-not-found ENOENT or `rev-parse` 128 not-a-repo)
+ * fail closed — including omitted/empty workingDirectory — and never fall
+ * through to trusted-root/subdir/non-repo gitless behavior.
+ */
+export function resolveWorkingDirectoryOrLinkedWorktree(workingDirectory) {
+    const callerLabel = workingDirectory && workingDirectory.length > 0 ? workingDirectory : 'session cwd';
+    const trustedProbe = probeGitTopLevel(process.cwd());
+    if (trustedProbe.status === 'probe_failed' || trustedProbe.status === 'git_missing') {
+        throw new Error(formatGitProbeFailedMessage(callerLabel));
+    }
+    let trustedRoot = process.cwd();
+    if (trustedProbe.status === 'ok') {
+        trustedRoot = trustedProbe.root;
+    }
+    else if (trustedProbe.status === 'not_a_repository') {
+        let cwdReal = process.cwd();
+        try {
+            cwdReal = realpathSync(cwdReal);
+        }
+        catch {
+            cwdReal = process.cwd();
+        }
+        if (existsSync(join(cwdReal, '.git')) && !isBareRepository(cwdReal)) {
+            throw new Error(formatGitProbeFailedMessage(callerLabel));
+        }
+        trustedRoot = process.cwd();
+    }
     if (!workingDirectory) {
-        return trustedRoot;
+        return { status: 'ok', root: trustedRoot };
     }
     const resolved = resolve(workingDirectory);
     let trustedRootReal;
@@ -1171,8 +2074,9 @@ export function validateWorkingDirectoryOrLinkedWorktree(workingDirectory) {
     catch {
         trustedRootReal = trustedRoot;
     }
-    const providedRoot = getGitTopLevel(resolved);
-    if (providedRoot) {
+    const providedProbe = probeGitTopLevel(resolved);
+    if (providedProbe.status === 'ok') {
+        const providedRoot = providedProbe.root;
         let providedRootReal;
         try {
             providedRootReal = realpathSync(providedRoot);
@@ -1181,19 +2085,19 @@ export function validateWorkingDirectoryOrLinkedWorktree(workingDirectory) {
             throw new Error(`workingDirectory '${workingDirectory}' does not exist or is not accessible.`);
         }
         if (providedRootReal === trustedRootReal) {
-            return providedRoot;
+            return { status: 'ok', root: providedRoot };
         }
         const trustedCommonDir = getGitCommonDir(trustedRoot);
         const providedCommonDir = getGitCommonDir(providedRoot);
         if (trustedCommonDir && providedCommonDir && providedCommonDir === trustedCommonDir) {
-            return providedRoot;
+            return { status: 'ok', root: providedRoot };
         }
-        console.error('[worktree] workingDirectory resolved to different git worktree root, using trusted root', {
-            workingDirectory: resolved,
-            providedRoot: providedRootReal,
-            trustedRoot: trustedRootReal,
-        });
-        return trustedRoot;
+        // Different repository (#3858): reject visibly instead of silently
+        // substituting the trusted root.
+        return foreignRepositoryResolution(providedRootReal, trustedRootReal, workingDirectory);
+    }
+    if (providedProbe.status === 'probe_failed' || providedProbe.status === 'git_missing') {
+        throw new Error(formatGitProbeFailedMessage(workingDirectory));
     }
     let resolvedReal;
     try {
@@ -1202,10 +2106,48 @@ export function validateWorkingDirectoryOrLinkedWorktree(workingDirectory) {
     catch {
         throw new Error(`workingDirectory '${workingDirectory}' does not exist or is not accessible.`);
     }
+    if (providedProbe.status === 'not_a_repository' &&
+        existsSync(join(resolvedReal, '.git')) &&
+        !isBareRepository(resolvedReal)) {
+        throw new Error(formatGitProbeFailedMessage(workingDirectory));
+    }
+    const gitMetadataDir = findGitMetadataDir(resolvedReal);
+    if (gitMetadataDir) {
+        let gitMetadataReal = gitMetadataDir;
+        try {
+            gitMetadataReal = realpathSync(gitMetadataDir);
+        }
+        catch {
+            gitMetadataReal = gitMetadataDir;
+        }
+        if (gitMetadataReal !== trustedRootReal) {
+            throw new Error(formatGitProbeFailedMessage(workingDirectory));
+        }
+    }
     const rel = relative(trustedRootReal, resolvedReal);
     if (rel.startsWith('..') || isAbsolute(rel)) {
-        throw new Error(`workingDirectory '${workingDirectory}' is outside the trusted worktree root '${trustedRoot}'.`);
+        throw new Error(formatOutsideTrustedRootMessage(workingDirectory, trustedRoot));
     }
-    return trustedRoot;
+    return { status: 'ok', root: trustedRoot };
+}
+/**
+ * Validate a workingDirectory while permitting linked git worktrees for the
+ * same repository.
+ *
+ * This preserves validateWorkingDirectory's default cwd behavior and its
+ * same-root/subdirectory normalization, but allows a per-call directory to
+ * resolve to a sibling manual `git worktree` when both worktrees share the
+ * same git common directory. A directory inside a different git repository is
+ * rejected with ForeignWorkingDirectoryError instead of silently falling back
+ * to the trusted startup cwd (#3858); non-repo paths outside the trusted root
+ * are rejected by throwing.
+ */
+export function validateWorkingDirectoryOrLinkedWorktree(workingDirectory) {
+    const resolution = resolveWorkingDirectoryOrLinkedWorktree(workingDirectory);
+    if (resolution.status === 'foreign_repository') {
+        const roots = getCanonicalWorkingDirectoryRoots(resolution);
+        throw new ForeignWorkingDirectoryError(roots.providedRoot, roots.trustedRoot, resolution.callerLabel);
+    }
+    return resolution.root;
 }
 //# sourceMappingURL=worktree-paths.js.map

@@ -9,8 +9,15 @@ vi.unmock('node:child_process');
 import { execFileSync } from 'child_process';
 // @ts-expect-error Local hook helper is a JS module loaded directly by the tests.
 import { evaluateAgentHeavyPreflight } from '../../scripts/lib/pre-tool-enforcer-preflight.mjs';
+import { clearWorktreeCache, getOmcRoot } from '../lib/worktree-paths.js';
 
 const SCRIPT_PATH = join(process.cwd(), 'scripts', 'pre-tool-enforcer.mjs');
+
+function makeGitTemp(prefix: string): string {
+  const directory = mkdtempSync(join(tmpdir(), prefix));
+  execFileSync('git', ['init'], { cwd: directory, stdio: 'pipe' });
+  return directory;
+}
 
 function runPreToolEnforcer(input: Record<string, unknown>): Record<string, unknown> {
   return runPreToolEnforcerWithEnv(input);
@@ -30,13 +37,24 @@ function runPreToolEnforcerWithEnv(
     env: {
       ...process.env,
       HOME: homeDir,
+      USERPROFILE: homeDir,
       CLAUDE_CONFIG_DIR: join(homeDir, '.claude'),
       NODE_ENV: 'test',
       DISABLE_OMC: '',
       OMC_SKIP_HOOKS: '',
+      OMC_STATE_DIR: '',
+      CLAUDE_PLUGIN_ROOT: '',
+      // Advisory verbosity: unset it so a contributor running with OMC_QUIET
+      // exported does not silence the advisories these tests assert on.
+      // The OMC_QUIET suites pass their own value via `env`, which wins below.
+      OMC_QUIET: '',
       // Reset Bedrock/routing env vars so tests are isolated from the host environment.
       // Tests that exercise Bedrock model-routing behaviour set these explicitly via `env`.
       OMC_AGENT_PREFLIGHT_CONTEXT_THRESHOLD: '',
+      // Read budget (issue #4054): reset so a host-exported off switch or
+      // threshold cannot mask the gate these tests assert on.
+      OMC_READ_BUDGET: '',
+      OMC_READ_BUDGET_MAX_LINES: '',
       OMC_ROUTING_FORCE_INHERIT: '',
       OMC_SUBAGENT_MODEL: '',
       CLAUDE_MODEL: '',
@@ -83,7 +101,7 @@ describe('pre-tool-enforcer advisory throttling (issue #3163)', () => {
   let tempDir: string;
 
   beforeEach(() => {
-    tempDir = mkdtempSync(join(tmpdir(), 'pre-tool-enforcer-advisory-throttle-'));
+    tempDir = makeGitTemp('pre-tool-enforcer-advisory-throttle-');
   });
 
   afterEach(() => {
@@ -247,7 +265,7 @@ describe('pre-tool-enforcer fallback gating (issue #970)', () => {
   let tempDir: string;
 
   beforeEach(() => {
-    tempDir = mkdtempSync(join(tmpdir(), 'pre-tool-enforcer-'));
+    tempDir = makeGitTemp('pre-tool-enforcer-');
   });
 
   afterEach(() => {
@@ -301,7 +319,7 @@ describe('pre-tool-enforcer fallback gating (issue #970)', () => {
   });
 
   it('uses legacy mode files when session_id is not provided', () => {
-    writeJson(join(tempDir, '.omc', 'state', 'ultrawork-state.json'), {
+    writeJson(join(tempDir, '.omc', 'state', 'ralph-state.json'), {
       active: true,
     });
 
@@ -1085,17 +1103,35 @@ describe('pre-tool-enforcer fallback gating (issue #970)', () => {
     const transcriptPath = join(tempDir, 'transcript.jsonl');
     writeTranscriptWithContext(transcriptPath, 1000, 800); // 80%
 
+    for (const threshold of ['abc', '95abc', '0', '101']) {
+      const output = evaluateAgentHeavyPreflight({
+        toolName: 'Task',
+        transcriptPath,
+        env: {
+          ...process.env,
+          OMC_AGENT_PREFLIGHT_CONTEXT_THRESHOLD: threshold,
+        },
+      });
+
+      expect(output?.decision).toBe('block');
+      expect(String(output?.reason)).toContain('threshold: 72%');
+    }
+  });
+
+  it('preserves a valid preflight threshold env value', () => {
+    const transcriptPath = join(tempDir, 'transcript.jsonl');
+    writeTranscriptWithContext(transcriptPath, 1000, 800); // 80%
+
     const output = evaluateAgentHeavyPreflight({
       toolName: 'Task',
       transcriptPath,
       env: {
         ...process.env,
-        OMC_AGENT_PREFLIGHT_CONTEXT_THRESHOLD: 'abc',
+        OMC_AGENT_PREFLIGHT_CONTEXT_THRESHOLD: '85',
       },
     });
 
-    expect(output?.decision).toBe('block');
-    expect(String(output?.reason)).toContain('threshold: 72%');
+    expect(output).toBeNull();
   });
 
   it('allows non-agent-heavy tools even when transcript context is high', () => {
@@ -1146,7 +1182,7 @@ describe('pre-tool-enforcer fallback gating (issue #970)', () => {
     ).toBeUndefined();
     expect(
       JSON.parse(readFileSync(join(sessionStateDir, 'ultrawork-state.json'), 'utf-8')).awaiting_confirmation,
-    ).toBeUndefined();
+    ).toBe(true);
   });
 
   // === Model routing / forceInherit tests (issue #1868 catch-22) ===
@@ -2139,7 +2175,7 @@ describe('pre-tool-enforcer force-agent-delegation enforcement', () => {
   let tempDir: string;
 
   beforeEach(() => {
-    tempDir = mkdtempSync(join(tmpdir(), 'pre-tool-enforcer-fad-'));
+    tempDir = makeGitTemp('pre-tool-enforcer-fad-');
   });
 
   afterEach(() => {
@@ -2301,7 +2337,7 @@ describe('pre-tool-enforcer agents.<name>.model injection (issue #3242)', () => 
   let xdgConfigHome: string;
 
   beforeEach(() => {
-    tempDir = mkdtempSync(join(tmpdir(), 'pre-tool-enforcer-agent-model-'));
+    tempDir = makeGitTemp('pre-tool-enforcer-agent-model-');
     xdgConfigHome = join(tempDir, 'xdg-config');
     mkdirSync(join(xdgConfigHome, 'claude-omc'), { recursive: true });
   });
@@ -2430,5 +2466,822 @@ describe('pre-tool-enforcer agents.<name>.model injection (issue #3242)', () => 
     expect(throttled.suppressOutput).toBe(true);
     expect(throttled.hookSpecificOutput).toBeDefined();
     expect(updatedModel(throttled)).toBe('sonnet');
+  });
+});
+describe('pre-tool-enforcer skill vs agent namespace guard (issue #3667)', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = makeGitTemp('pre-tool-enforcer-skill-agent-');
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function runTask(
+    subagentType: unknown,
+    toolName = 'Task',
+    extraInput: Record<string, unknown> = {},
+    env: Record<string, string> = {},
+  ): Record<string, unknown> {
+    return runPreToolEnforcerWithEnv(
+      {
+        tool_name: toolName,
+        cwd: tempDir,
+        session_id: 'session-3667',
+        transcript_path: '',
+        toolInput: {
+          subagent_type: subagentType,
+          description: 'Some task',
+          prompt: 'Do something',
+          ...extraInput,
+        },
+      },
+      env,
+    );
+  }
+
+  function denyReason(output: Record<string, unknown>): string {
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+    return String(hookOutput.permissionDecisionReason ?? '');
+  }
+
+  it('denies Task call whose subagent_type names a bundled skill (oh-my-claudecode:ai-slop-cleaner)', () => {
+    const output = runTask('oh-my-claudecode:ai-slop-cleaner');
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+
+    expect(output.continue).toBe(true);
+    expect(hookOutput.permissionDecision).toBe('deny');
+    expect(hookOutput.permissionDecisionReason as string).toContain('[SKILL vs AGENT]');
+    expect(hookOutput.permissionDecisionReason as string).toContain('ai-slop-cleaner');
+    // Names the correct tool and identifier — no generic "Agent type not found".
+    expect(hookOutput.permissionDecisionReason as string).toContain(
+      'Skill(skill="oh-my-claudecode:ai-slop-cleaner")',
+    );
+    // Forbids closest-match substitution (code-simplifier is the attractive wrong answer).
+    expect(hookOutput.permissionDecisionReason as string).toContain('closest match');
+    expect(hookOutput.permissionDecisionReason as string).not.toContain('code-simplifier');
+  });
+
+  it('denies Agent call with a bare bundled skill identifier and suggests the canonical namespaced identifier', () => {
+    const output = runTask('ai-slop-cleaner', 'Agent');
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+
+    expect(hookOutput.permissionDecision).toBe('deny');
+    // Recovery must be unambiguous: always the plugin-namespaced form, never a
+    // bare skill name that could resolve to a different project/user skill.
+    expect(denyReason(output)).toContain('Skill(skill="oh-my-claudecode:ai-slop-cleaner")');
+    expect(denyReason(output)).not.toContain('Skill(skill="ai-slop-cleaner")');
+  });
+
+  it('recognizes the omc: namespace alias and suggests the canonical oh-my-claudecode: identifier', () => {
+    const output = runTask('omc:ai-slop-cleaner');
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+
+    expect(hookOutput.permissionDecision).toBe('deny');
+    expect(denyReason(output)).toContain('Skill(skill="oh-my-claudecode:ai-slop-cleaner")');
+  });
+
+  it('denies skill-as-agent even when an explicit model is present (guard precedes model routing)', () => {
+    const output = runTask('oh-my-claudecode:ai-slop-cleaner', 'Task', { model: 'sonnet' });
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+
+    expect(hookOutput.permissionDecision).toBe('deny');
+    expect(denyReason(output)).toContain('[SKILL vs AGENT]');
+  });
+
+  it('denies skill-as-agent even under force-inherit routing', () => {
+    const output = runTask('oh-my-claudecode:ai-slop-cleaner', 'Task', {}, { OMC_ROUTING_FORCE_INHERIT: 'true' });
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+
+    expect(hookOutput.permissionDecision).toBe('deny');
+    expect(denyReason(output)).toContain('[SKILL vs AGENT]');
+  });
+
+  it('maps a skill alias to its primary name in the Skill-tool identifier', () => {
+    const output = runTask('oh-my-claudecode:cancel-ralph');
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+
+    expect(hookOutput.permissionDecision).toBe('deny');
+    expect(denyReason(output)).toContain('alias of "cancel"');
+    expect(denyReason(output)).toContain('Skill(skill="oh-my-claudecode:cancel")');
+  });
+
+  it('recognizes the renamed plan skill dir through its registered name omc-plan', () => {
+    const output = runTask('oh-my-claudecode:plan');
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+
+    expect(hookOutput.permissionDecision).toBe('deny');
+    expect(denyReason(output)).toContain('omc-plan');
+    expect(denyReason(output)).toContain('Skill(skill="oh-my-claudecode:omc-plan")');
+  });
+
+
+  it('does NOT deny a real agent identifier (code-simplifier passes through)', () => {
+    const output = runTask('oh-my-claudecode:code-simplifier');
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+
+    expect(output.continue).toBe(true);
+    expect(hookOutput.permissionDecision).toBeUndefined();
+    expect(JSON.stringify(output)).not.toContain('[SKILL vs AGENT]');
+  });
+
+  it('does NOT deny a genuinely unknown agent identifier', () => {
+    const output = runTask('oh-my-claudecode:nonexistent-agent-xyz');
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+
+    expect(output.continue).toBe(true);
+    expect(hookOutput.permissionDecision).toBeUndefined();
+    expect(JSON.stringify(output)).not.toContain('[SKILL vs AGENT]');
+  });
+
+  it('does NOT fuzzy-match a typo to a skill (no unsafe closest-match substitution)', () => {
+    const output = runTask('oh-my-claudecode:ai-slop-cleanr');
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+
+    expect(output.continue).toBe(true);
+    expect(hookOutput.permissionDecision).toBeUndefined();
+    expect(JSON.stringify(output)).not.toContain('[SKILL vs AGENT]');
+  });
+
+  it('lets a plugin agent with the same name as a skill win the collision (namespaced call)', () => {
+    const pluginRoot = join(tempDir, 'plugin');
+    mkdirSync(join(pluginRoot, 'agents'), { recursive: true });
+    mkdirSync(join(pluginRoot, 'skills', 'wiki'), { recursive: true });
+    writeFileSync(join(pluginRoot, 'agents', 'wiki.md'), '---\nname: wiki\n---\nagent body\n');
+    writeFileSync(join(pluginRoot, 'skills', 'wiki', 'SKILL.md'), '---\nname: wiki\n---\nskill body\n');
+
+    const output = runPreToolEnforcerWithEnv(
+      {
+        tool_name: 'Task',
+        cwd: tempDir,
+        session_id: 'session-3667-collision',
+        transcript_path: '',
+        toolInput: {
+          subagent_type: 'oh-my-claudecode:wiki',
+          description: 'Some task',
+          prompt: 'Do something',
+        },
+      },
+      { CLAUDE_PLUGIN_ROOT: pluginRoot },
+    );
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+
+    expect(output.continue).toBe(true);
+    expect(hookOutput.permissionDecision).toBeUndefined();
+    expect(JSON.stringify(output)).not.toContain('[SKILL vs AGENT]');
+  });
+
+  it('lets a project agent with the same name as a skill win the collision (bare call)', () => {
+    mkdirSync(join(tempDir, '.claude', 'agents'), { recursive: true });
+    writeFileSync(join(tempDir, '.claude', 'agents', 'wiki.md'), '---\nname: wiki\n---\nagent body\n');
+
+    const output = runTask('wiki');
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+
+    expect(output.continue).toBe(true);
+    expect(hookOutput.permissionDecision).toBeUndefined();
+    expect(JSON.stringify(output)).not.toContain('[SKILL vs AGENT]');
+  });
+
+  it('denies a bare bundled skill name when no agent definition resolves it anywhere', () => {
+    // tempDir has no .claude/agents and no user-config agents; wiki resolves only as a skill.
+    const output = runTask('wiki');
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+
+    expect(hookOutput.permissionDecision).toBe('deny');
+    expect(denyReason(output)).toContain('Skill(skill="oh-my-claudecode:wiki")');
+  });
+
+  it('does NOT deny non-string or empty subagent_type values', () => {
+    const numeric = runTask(42 as unknown as string);
+    const empty = runTask('   ');
+    expect(numeric.hookSpecificOutput as Record<string, unknown>).not.toHaveProperty('permissionDecision');
+    expect(empty.hookSpecificOutput as Record<string, unknown>).not.toHaveProperty('permissionDecision');
+  });
+  it.each(['remember', 'verify', 'debug'])(
+    'denies the namespaced %s skill for a non-skininthegamebros user (USER_TYPE != ant)',
+    (skill) => {
+      const output = runTask(`oh-my-claudecode:${skill}`, 'Task', {}, { USER_TYPE: '' });
+      expect(output.continue).toBe(true);
+      expect((output.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBe('deny');
+      expect(denyReason(output)).toContain(`Skill(skill="oh-my-claudecode:${skill}")`);
+    },
+  );
+
+  it.each(['remember', 'verify', 'debug'])(
+    'denies the %s skill for a skininthegamebros user (USER_TYPE=ant)',
+    (hiddenSkill) => {
+      const output = runTask(`oh-my-claudecode:${hiddenSkill}`, 'Task', {}, { USER_TYPE: 'ant' });
+      const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+
+      expect(hookOutput.permissionDecision).toBe('deny');
+      expect(denyReason(output)).toContain(`Skill(skill="oh-my-claudecode:${hiddenSkill}")`);
+    },
+  );
+
+  it('denies every visible skill for a non-skininthegamebros user', () => {
+    const visible = runTask('oh-my-claudecode:plan', 'Task', {}, { USER_TYPE: '' });
+    const remember = runTask('oh-my-claudecode:remember', 'Task', {}, { USER_TYPE: '' });
+
+    expect((visible.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBe('deny');
+    expect(denyReason(visible)).toContain('Skill(skill="oh-my-claudecode:omc-plan")');
+    expect((remember.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBe('deny');
+  });
+  describe('case-insensitive identifier folding (Windows/macOS semantics, issue #3667)', () => {
+    it('does NOT suggest a runtime-hidden skill when a case-variant identifier resolves its directory (case-insensitive-faithful harness)', () => {
+      // Simulate a case-insensitive filesystem: the plugin root holds the
+      // hidden skill at the case-variant path `skills/Remember/SKILL.md`,
+      // exactly as a case-insensitive fs would resolve `skills/remember`.
+      const pluginRoot = join(tempDir, 'ci-plugin');
+      mkdirSync(join(pluginRoot, 'skills', 'Remember'), { recursive: true });
+      writeFileSync(
+        join(pluginRoot, 'skills', 'Remember', 'SKILL.md'),
+        '---\nname: remember\n---\nhidden skill body\n',
+      );
+
+      const run = (subagentType: string, env: Record<string, string>) =>
+        runPreToolEnforcerWithEnv(
+          {
+            tool_name: 'Task',
+            cwd: tempDir,
+            session_id: 'session-3667-ci',
+            transcript_path: '',
+            toolInput: { subagent_type: subagentType, description: 'd', prompt: 'p' },
+          },
+          { CLAUDE_PLUGIN_ROOT: pluginRoot, USER_TYPE: '', ...env },
+        );
+
+      const nonAnt = run('oh-my-claudecode:Remember', {});
+      const nonAntLower = run('oh-my-claudecode:remember', {});
+      const ant = run('oh-my-claudecode:Remember', { USER_TYPE: 'ant' });
+
+      expect((nonAnt.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBe('deny');
+      expect(denyReason(nonAnt)).toContain('Skill(skill="oh-my-claudecode:remember")');
+      expect((nonAntLower.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBe('deny');
+      // Canonical lowercase output spelling is preserved for every user.
+      expect((ant.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBe('deny');
+      expect(denyReason(ant)).toContain('Skill(skill="oh-my-claudecode:remember")');
+    });
+
+    it.each([
+      ['oh-my-claudecode:Plan', 'oh-my-claudecode:omc-plan'],
+      ['oh-my-claudecode:AI-Slop-Cleaner', 'oh-my-claudecode:ai-slop-cleaner'],
+      ['oh-my-claudecode:Cancel-Ralph', 'oh-my-claudecode:cancel'],
+      ['oh-my-claudecode:PSM', 'oh-my-claudecode:project-session-manager'],
+    ])('denies mixed-case %s with the canonical namespaced identifier %s', (input, expected) => {
+      const output = runTask(input, 'Task', {}, { USER_TYPE: '' });
+      const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+      expect(hookOutput.permissionDecision).toBe('deny');
+      expect(denyReason(output)).toContain(`Skill(skill="${expected}")`);
+    });
+
+    it.each(['Remember', 'VERIFY', 'Debug'])(
+      'denies the mixed-case visible %s skill for a non-ant user',
+      (skill) => {
+        const output = runTask(`oh-my-claudecode:${skill}`, 'Task', {}, { USER_TYPE: '' });
+        expect((output.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBe('deny');
+        expect(denyReason(output)).toContain(`Skill(skill="oh-my-claudecode:${skill.toLowerCase()}")`);
+      },
+    );
+
+    it('recognizes case-variant namespace aliases (OMC: / OH-MY-CLAUDECODE:)', () => {
+      const omcUpper = runTask('OMC:ai-slop-cleaner', 'Task', {}, { USER_TYPE: '' });
+      const fullUpper = runTask('OH-MY-CLAUDECODE:Remember', 'Task', {}, { USER_TYPE: '' });
+
+      expect((omcUpper.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBe('deny');
+      expect(denyReason(omcUpper)).toContain('Skill(skill="oh-my-claudecode:ai-slop-cleaner")');
+      expect((fullUpper.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBe('deny');
+      expect(denyReason(fullUpper)).toContain('Skill(skill="oh-my-claudecode:remember")');
+    });
+
+    it('applies case folding before explicit-model and force-inherit routing', () => {
+      const withModel = runTask('oh-my-claudecode:Plan', 'Task', { model: 'sonnet' }, { USER_TYPE: '' });
+      expect((withModel.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBe('deny');
+      expect(denyReason(withModel)).toContain('Skill(skill="oh-my-claudecode:omc-plan")');
+
+      const forceInheritVisible = runTask(
+        'oh-my-claudecode:Plan',
+        'Task',
+        {},
+        { USER_TYPE: '', OMC_ROUTING_FORCE_INHERIT: 'true' },
+      );
+      expect((forceInheritVisible.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBe('deny');
+      expect(denyReason(forceInheritVisible)).toContain('Skill(skill="oh-my-claudecode:omc-plan")');
+
+      const forceInheritRemember = runTask(
+        'oh-my-claudecode:Remember',
+        'Task',
+        {},
+        { USER_TYPE: '', OMC_ROUTING_FORCE_INHERIT: 'true' },
+      );
+      expect((forceInheritRemember.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBe('deny');
+      expect(denyReason(forceInheritRemember)).toContain('Skill(skill="oh-my-claudecode:remember")');
+    });
+  });
+  describe('native/session-defined bare agent boundary (issue #3667 P1)', () => {
+    it.each(['plan', 'Plan', 'general-purpose'])(
+      'does NOT deny the bare %s identifier (native Claude agents are not file-discoverable)',
+      (nativeAgent) => {
+        const output = runTask(nativeAgent, 'Task', {}, { USER_TYPE: '' });
+        expect((output.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBeUndefined();
+        expect(JSON.stringify(output)).not.toContain('[SKILL vs AGENT]');
+      },
+    );
+
+    it('denies the plugin-namespaced plan identifier while preserving bare plan', () => {
+      const namespaced = runTask('oh-my-claudecode:plan', 'Task', {}, { USER_TYPE: '' });
+      const omcAlias = runTask('omc:plan', 'Task', {}, { USER_TYPE: '' });
+      const bare = runTask('plan', 'Task', {}, { USER_TYPE: '' });
+
+      expect((namespaced.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBe('deny');
+      expect(denyReason(namespaced)).toContain('Skill(skill="oh-my-claudecode:omc-plan")');
+      expect((omcAlias.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBe('deny');
+      expect(denyReason(omcAlias)).toContain('Skill(skill="oh-my-claudecode:omc-plan")');
+      expect((bare.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBeUndefined();
+    });
+
+    it('still denies bare canonical-registry skill claims (omc-plan, ai-slop-cleaner)', () => {
+      for (const [input, expected] of [
+        ['omc-plan', 'oh-my-claudecode:omc-plan'],
+        ['ai-slop-cleaner', 'oh-my-claudecode:ai-slop-cleaner'],
+      ] as const) {
+        const output = runTask(input, 'Task', {}, { USER_TYPE: '' });
+        const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+        expect(hookOutput.permissionDecision).toBe('deny');
+        expect(denyReason(output)).toContain(`Skill(skill="${expected}")`);
+      }
+    });
+
+    it('keeps plugin/project agent collisions winning over skills for bare names', () => {
+      // Project agent named `wiki` (also a canonical skill claim) must win.
+      mkdirSync(join(tempDir, '.claude', 'agents'), { recursive: true });
+      writeFileSync(join(tempDir, '.claude', 'agents', 'wiki.md'), '---\nname: wiki\n---\nagent body\n');
+      const output = runTask('wiki', 'Task', {}, { USER_TYPE: '' });
+      expect((output.hookSpecificOutput as Record<string, unknown>).permissionDecision).toBeUndefined();
+      expect(JSON.stringify(output)).not.toContain('[SKILL vs AGENT]');
+    });
+  });
+});
+
+describe('pre-tool-enforcer session-scoped agent tracking (issue #3732)', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = makeGitTemp('pre-tool-enforcer-session-tracking-');
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function spawnAdvisory(sessionId: string): Record<string, unknown> {
+    return runPreToolEnforcer({
+      tool_name: 'Task',
+      cwd: tempDir,
+      session_id: sessionId,
+      toolInput: {
+        subagent_type: 'oh-my-claudecode:executor',
+        description: 'issue #3732 regression',
+      },
+    });
+  }
+
+  it('reports running agents from the session-scoped tracking file', () => {
+    const sessionId = 'session-3732-scoped';
+    writeJson(join(tempDir, '.omc', 'state', 'sessions', sessionId, 'subagent-tracking-state.json'), {
+      agents: [
+        { agent_id: 'a1', agent_type: 'oh-my-claudecode:executor', status: 'running' },
+        { agent_id: 'a2', agent_type: 'oh-my-claudecode:executor', status: 'running' },
+      ],
+      total_spawned: 203,
+      total_completed: 185,
+      total_failed: 0,
+      last_updated: new Date().toISOString(),
+    });
+
+    const output = spawnAdvisory(sessionId);
+    const advisory = (output.hookSpecificOutput as Record<string, unknown>).additionalContext as string;
+    expect(advisory).toContain('Active agents: 2');
+  });
+
+  it('prefers session-scoped state over a stale legacy file', () => {
+    const sessionId = 'session-3732-precedence';
+    writeJson(join(tempDir, '.omc', 'state', 'sessions', sessionId, 'subagent-tracking-state.json'), {
+      agents: [
+        { agent_id: 'a1', agent_type: 'oh-my-claudecode:executor', status: 'running' },
+      ],
+      total_spawned: 203,
+      total_completed: 185,
+      total_failed: 0,
+      last_updated: new Date().toISOString(),
+    });
+    // Stale legacy file with contradictory counters (the 160-vs-203 symptom).
+    writeJson(join(tempDir, '.omc', 'state', 'subagent-tracking.json'), {
+      agents: [],
+      total_spawned: 160,
+      total_completed: 0,
+      total_failed: 0,
+      last_updated: new Date(0).toISOString(),
+    });
+
+    const output = spawnAdvisory(sessionId);
+    const advisory = (output.hookSpecificOutput as Record<string, unknown>).additionalContext as string;
+    expect(advisory).toContain('Active agents: 1');
+  });
+
+  it('falls back to the legacy file when no session-scoped state exists', () => {
+    const sessionId = 'session-3732-legacy';
+    writeJson(join(tempDir, '.omc', 'state', 'subagent-tracking.json'), {
+      agents: [
+        { agent_id: 'b1', agent_type: 'oh-my-claudecode:executor', status: 'running' },
+      ],
+      total_spawned: 7,
+      total_completed: 2,
+      total_failed: 0,
+      last_updated: new Date().toISOString(),
+    });
+
+    const output = spawnAdvisory(sessionId);
+    const advisory = (output.hookSpecificOutput as Record<string, unknown>).additionalContext as string;
+    expect(advisory).toContain('Active agents: 1');
+  });
+  it('falls back to the canonical resolver legacy name when no session-scoped or plain legacy file exists', () => {
+    const sessionId = 'session-3732-canonical-legacy';
+    // The canonical resolver's legacy read path is
+    // .omc/state/subagent-tracking-state.json (normalized name), distinct from
+    // the pre-Wave-A plain subagent-tracking.json. The read must route through
+    // resolveSessionStatePathsForHook and honor this name too.
+    writeJson(join(tempDir, '.omc', 'state', 'subagent-tracking-state.json'), {
+      agents: [
+        { agent_id: 'c1', agent_type: 'oh-my-claudecode:executor', status: 'running' },
+      ],
+      total_spawned: 11,
+      total_completed: 10,
+      total_failed: 0,
+      last_updated: new Date().toISOString(),
+    });
+
+    const output = spawnAdvisory(sessionId);
+    const advisory = (output.hookSpecificOutput as Record<string, unknown>).additionalContext as string;
+    expect(advisory).toContain('Active agents: 1');
+  });
+
+  it('resolves the session-scoped tracking read through OMC_STATE_DIR centralized state', () => {
+    const sessionId = 'session-3732-centralized';
+    const centralRoot = mkdtempSync(join(tmpdir(), 'pre-tool-enforcer-central-'));
+    const previousStateDir = process.env.OMC_STATE_DIR;
+    let output: Record<string, unknown>;
+    try {
+      process.env.OMC_STATE_DIR = centralRoot;
+      clearWorktreeCache();
+      const stateRoot = getOmcRoot(centralRoot);
+      writeJson(join(stateRoot, 'state', 'sessions', sessionId, 'subagent-tracking-state.json'), {
+      session_id: sessionId,
+        agents: [
+          { agent_id: 'z1', agent_type: 'oh-my-claudecode:executor', status: 'running' },
+        ],
+        total_spawned: 4,
+        total_completed: 3,
+        total_failed: 0,
+        last_updated: new Date().toISOString(),
+      });
+
+      output = runPreToolEnforcerWithEnv(
+        {
+          tool_name: 'Task',
+          cwd: centralRoot,
+          session_id: sessionId,
+          toolInput: {
+            subagent_type: 'oh-my-claudecode:executor',
+            description: 'issue #3732 centralized regression',
+          },
+        },
+        { OMC_STATE_DIR: centralRoot },
+      );
+    } finally {
+      if (previousStateDir === undefined) delete process.env.OMC_STATE_DIR;
+      else process.env.OMC_STATE_DIR = previousStateDir;
+      clearWorktreeCache();
+    rmSync(centralRoot, { recursive: true, force: true });
+    }
+
+    const advisory = (output.hookSpecificOutput as Record<string, unknown>).additionalContext as string;
+    // The canonical resolver (not manual join(stateDir, ...)) routes the read
+    // into the centralized state root; a manual stateDir join would miss it.
+    expect(advisory).toContain('Active agents: 1');
+  });
+
+  it('rejects invalid session ids before scoped resolution (no escaped read)', () => {
+    // A payload with a path-traversal id must not reach the escaped
+    // .omc/state/evil/ location: only the safe legacy roots may be probed.
+    // Under the pre-fix code the unvalidated id flowed into the inline
+    // resolver fallback, join()-normalized `sessions/../evil` into `state/evil`,
+    // and reported counters from the unrelated file below.
+    writeJson(join(tempDir, '.omc', 'state', 'evil', 'subagent-tracking-state.json'), {
+      agents: [
+        { agent_id: 'x1', agent_type: 'oh-my-claudecode:executor', status: 'running' },
+        { agent_id: 'x2', agent_type: 'oh-my-claudecode:executor', status: 'running' },
+      ],
+      total_spawned: 99,
+      last_updated: new Date().toISOString(),
+    });
+    writeJson(join(tempDir, '.omc', 'state', 'subagent-tracking.json'), {
+      agents: [
+        { agent_id: 'l1', agent_type: 'oh-my-claudecode:executor', status: 'running' },
+      ],
+      total_spawned: 7,
+      last_updated: new Date().toISOString(),
+    });
+
+    const output = spawnAdvisory('../evil');
+    const advisory = (output.hookSpecificOutput as Record<string, unknown>).additionalContext as string;
+    // Safe legacy roots still work for invalid ids...
+    expect(advisory).toContain('Active agents: 1');
+    // ...but the escaped session-scoped file is never read.
+    expect(advisory).not.toContain('Active agents: 2');
+  });
+
+  it('skips a malformed session-scoped candidate and falls back to the legacy file', () => {
+    const sessionId = 'session-3732-malformed';
+    // Parseable but shape-corrupt: `agents` is not an array. This candidate
+    // must be skipped locally so the legacy fallback still resolves and the
+    // hook keeps running instead of aborting into suppressOutput.
+    writeJson(join(tempDir, '.omc', 'state', 'sessions', sessionId, 'subagent-tracking-state.json'), {
+      agents: 'corrupt',
+    });
+    writeJson(join(tempDir, '.omc', 'state', 'subagent-tracking.json'), {
+      agents: [
+        { agent_id: 'l1', agent_type: 'oh-my-claudecode:executor', status: 'running' },
+      ],
+      total_spawned: 7,
+      last_updated: new Date().toISOString(),
+    });
+
+    const output = spawnAdvisory(sessionId);
+    const advisory = (output.hookSpecificOutput as Record<string, unknown>).additionalContext as string;
+    expect(advisory).toContain('Active agents: 1');
+  });
+
+  it('does not let a malformed scoped canonical file suppress the canonical legacy file', () => {
+    const sessionId = 'session-3732-malformed-scoped-canonical';
+    // The session-scoped canonical file exists but is shape-corrupt; the
+    // canonical legacy file for the SAME state name holds the valid data. The
+    // resolver's effective read points at the (malformed) scoped file, so the
+    // legacy file must still be probed explicitly instead of being skipped.
+    writeJson(join(tempDir, '.omc', 'state', 'sessions', sessionId, 'subagent-tracking-state.json'), {
+      agents: 'corrupt',
+    });
+    writeJson(join(tempDir, '.omc', 'state', 'subagent-tracking-state.json'), {
+      agents: [
+        { agent_id: 'c1', agent_type: 'oh-my-claudecode:executor', status: 'running' },
+      ],
+      total_spawned: 11,
+      last_updated: new Date().toISOString(),
+    });
+
+    const output = spawnAdvisory(sessionId);
+    const advisory = (output.hookSpecificOutput as Record<string, unknown>).additionalContext as string;
+    expect(advisory).toContain('Active agents: 1');
+  });
+
+  it('reads the canonical legacy file when no session id is observable', () => {
+    // No session_id in the payload: the canonical legacy
+    // subagent-tracking-state.json must still be probed (the suffixed state
+    // name the pre-fix reader used normalizes to a nonexistent
+    // `-state.json` name and silently skipped it).
+    writeJson(join(tempDir, '.omc', 'state', 'subagent-tracking-state.json'), {
+      agents: [
+        { agent_id: 'c1', agent_type: 'oh-my-claudecode:executor', status: 'running' },
+      ],
+      total_spawned: 11,
+      last_updated: new Date().toISOString(),
+    });
+
+    const output = runPreToolEnforcer({
+      tool_name: 'Task',
+      cwd: tempDir,
+      toolInput: {
+        subagent_type: 'oh-my-claudecode:executor',
+        description: 'issue #3732 no-session regression',
+      },
+    });
+    const advisory = (output.hookSpecificOutput as Record<string, unknown>).additionalContext as string;
+    expect(advisory).toContain('Active agents: 1');
+  });
+
+  it('survives all-malformed tracking candidates with a zero count', () => {
+    const sessionId = 'session-3732-all-malformed';
+    writeJson(join(tempDir, '.omc', 'state', 'sessions', sessionId, 'subagent-tracking-state.json'), {
+      agents: 'corrupt',
+    });
+    writeJson(join(tempDir, '.omc', 'state', 'subagent-tracking.json'), {
+      agents: { agent_id: 'nope' },
+      total_spawned: 42,
+    });
+
+    const output = spawnAdvisory(sessionId);
+    expect(output.continue).toBe(true);
+    // The spawn advisory still flows (no abort into the broad catch's
+    // suppressOutput-only path), with a zero agent count.
+    const advisory = (output.hookSpecificOutput as Record<string, unknown>).additionalContext as string;
+    expect(advisory).toContain('Spawning agent:');
+    expect(advisory).not.toContain('Active agents:');
+  });
+});
+
+describe('pre-tool-enforcer read budget enforcement (issue #4054)', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = makeGitTemp('pre-tool-enforcer-read-budget-');
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function writeFileWithLines(name: string, lines: number): string {
+    const filePath = join(tempDir, name);
+    mkdirSync(dirname(filePath), { recursive: true });
+    writeFileSync(filePath, `${Array.from({ length: lines }, (_, i) => `line ${i + 1}`).join('\n')}\n`);
+    return filePath;
+  }
+
+  function writeReadBudgetConfig(readBudget: Record<string, unknown>): void {
+    writeJson(join(tempDir, '.omc', 'config.json'), { context: { readBudget } });
+  }
+
+  function readFullFile(filePath: string, session: string, env: Record<string, string> = {}) {
+    return runPreToolEnforcerWithEnv(
+      {
+        tool_name: 'Read',
+        toolInput: { file_path: filePath },
+        cwd: tempDir,
+        session_id: session,
+      },
+      env,
+    );
+  }
+
+  function hookOutputOf(output: Record<string, unknown>): Record<string, unknown> {
+    return (output.hookSpecificOutput as Record<string, unknown>) || {};
+  }
+
+  it('warns on the first unbounded read of an oversized file and denies the next one', () => {
+    writeReadBudgetConfig({ maxLines: 50 });
+    const filePath = writeFileWithLines('big.ts', 400);
+
+    const first = readFullFile(filePath, 'session-rb-warn');
+    const firstHook = hookOutputOf(first);
+    expect(first.continue).toBe(true);
+    expect(firstHook.permissionDecision).toBeUndefined();
+    expect(String(firstHook.additionalContext)).toContain('[OMC READ BUDGET]');
+    expect(String(firstHook.additionalContext)).toContain('400 lines');
+    expect(String(firstHook.additionalContext)).toContain('lsp_document_symbols');
+
+    const second = readFullFile(filePath, 'session-rb-warn');
+    const secondHook = hookOutputOf(second);
+    expect(secondHook.hookEventName).toBe('PreToolUse');
+    expect(secondHook.permissionDecision).toBe('deny');
+    expect(String(secondHook.permissionDecisionReason)).toContain('Denied');
+    expect(String(secondHook.permissionDecisionReason)).toContain('budget 50');
+    expect(String(secondHook.permissionDecisionReason)).toContain('ast_grep_search');
+  });
+
+  it('allows a targeted read of the same oversized file', () => {
+    writeReadBudgetConfig({ maxLines: 50 });
+    const filePath = writeFileWithLines('big.ts', 400);
+
+    for (const toolInput of [
+      { file_path: filePath, offset: 1, limit: 100 },
+      { file_path: filePath, limit: 20 },
+      { file_path: filePath, offset: 300 },
+    ]) {
+      const output = runPreToolEnforcer({
+        tool_name: 'Read',
+        toolInput,
+        cwd: tempDir,
+        session_id: 'session-rb-targeted',
+      });
+      const hook = hookOutputOf(output);
+      expect(hook.permissionDecision).toBeUndefined();
+      expect(String(hook.additionalContext || '')).not.toContain('READ BUDGET');
+    }
+  });
+
+  it('ignores files at or under the budget', () => {
+    writeReadBudgetConfig({ maxLines: 50 });
+    const exact = writeFileWithLines('exact.ts', 50);
+    const small = writeFileWithLines('small.ts', 10);
+
+    for (const filePath of [exact, small]) {
+      const hook = hookOutputOf(readFullFile(filePath, 'session-rb-small'));
+      expect(hook.permissionDecision).toBeUndefined();
+      expect(String(hook.additionalContext || '')).not.toContain('READ BUDGET');
+    }
+  });
+
+  it('ignores paths matched by the allowlist', () => {
+    writeReadBudgetConfig({ maxLines: 50, allowPaths: ['docs/**', 'CHANGELOG.md'] });
+    const doc = writeFileWithLines('docs/adr/0001-decision.md', 400);
+    const changelog = writeFileWithLines('CHANGELOG.md', 900);
+
+    for (const filePath of [doc, changelog]) {
+      const hook = hookOutputOf(readFullFile(filePath, 'session-rb-allow'));
+      expect(hook.permissionDecision).toBeUndefined();
+      expect(String(hook.additionalContext || '')).not.toContain('READ BUDGET');
+    }
+  });
+
+  it('denies immediately in deny mode and never denies in warn mode', () => {
+    writeReadBudgetConfig({ maxLines: 50, mode: 'deny' });
+    const filePath = writeFileWithLines('big.ts', 400);
+    const denied = hookOutputOf(readFullFile(filePath, 'session-rb-deny'));
+    expect(denied.permissionDecision).toBe('deny');
+
+    writeReadBudgetConfig({ maxLines: 50, mode: 'warn' });
+    for (let i = 0; i < 3; i++) {
+      const hook = hookOutputOf(readFullFile(filePath, 'session-rb-warn-only'));
+      expect(hook.permissionDecision).toBeUndefined();
+      expect(String(hook.additionalContext)).toContain('[OMC READ BUDGET]');
+    }
+  });
+
+  it('honours the off switch and the env threshold override', () => {
+    writeReadBudgetConfig({ maxLines: 50, mode: 'deny' });
+    const filePath = writeFileWithLines('big.ts', 400);
+
+    const off = hookOutputOf(readFullFile(filePath, 'session-rb-off', { OMC_READ_BUDGET: 'off' }));
+    expect(off.permissionDecision).toBeUndefined();
+    expect(String(off.additionalContext || '')).not.toContain('READ BUDGET');
+
+    const raised = hookOutputOf(
+      readFullFile(filePath, 'session-rb-env', { OMC_READ_BUDGET_MAX_LINES: '1000' }),
+    );
+    expect(raised.permissionDecision).toBeUndefined();
+  });
+
+  it('respects enabled: false', () => {
+    writeReadBudgetConfig({ enabled: false, maxLines: 50, mode: 'deny' });
+    const filePath = writeFileWithLines('big.ts', 400);
+    const hook = hookOutputOf(readFullFile(filePath, 'session-rb-disabled'));
+    expect(hook.permissionDecision).toBeUndefined();
+  });
+
+  it('gates a bare cat but allows piped, redirected, and ranged shell reads', () => {
+    writeReadBudgetConfig({ maxLines: 50, mode: 'deny' });
+    const filePath = writeFileWithLines('big.ts', 400);
+
+    const bareCat = runPreToolEnforcer({
+      tool_name: 'Bash',
+      toolInput: { command: `cat ${filePath}` },
+      cwd: tempDir,
+      session_id: 'session-rb-cat',
+    });
+    expect(hookOutputOf(bareCat).permissionDecision).toBe('deny');
+
+    for (const command of [
+      `cat ${filePath} | grep line`,
+      `cat ${filePath} > /tmp/out.txt`,
+      `sed -n '1,200p' ${filePath}`,
+      `wc -l ${filePath}`,
+    ]) {
+      const output = runPreToolEnforcer({
+        tool_name: 'Bash',
+        toolInput: { command },
+        cwd: tempDir,
+        session_id: 'session-rb-cat-allowed',
+      });
+      expect(hookOutputOf(output).permissionDecision).toBeUndefined();
+    }
+  });
+
+  it('ignores missing files and non-read tools', () => {
+    writeReadBudgetConfig({ maxLines: 50, mode: 'deny' });
+    const missing = hookOutputOf(readFullFile(join(tempDir, 'nope.ts'), 'session-rb-missing'));
+    expect(missing.permissionDecision).toBeUndefined();
+
+    const filePath = writeFileWithLines('big.ts', 400);
+    const write = runPreToolEnforcer({
+      tool_name: 'Write',
+      toolInput: { file_path: filePath, content: 'x' },
+      cwd: tempDir,
+      session_id: 'session-rb-write',
+    });
+    expect(hookOutputOf(write).permissionDecision).toBeUndefined();
+  });
+
+  it('applies the 1500-line default when no config is present', () => {
+    const under = writeFileWithLines('under.ts', 1200);
+    const over = writeFileWithLines('over.ts', 1600);
+
+    expect(hookOutputOf(readFullFile(under, 'session-rb-default')).additionalContext || '').not.toContain(
+      'READ BUDGET',
+    );
+    expect(String(hookOutputOf(readFullFile(over, 'session-rb-default')).additionalContext)).toContain(
+      'budget 1500',
+    );
   });
 });

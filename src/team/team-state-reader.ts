@@ -45,7 +45,7 @@ function manifestOnly(config: TeamConfig, manifest: TeamManifestV2 | null): Team
   // Only fields absent from config are safe projection backfill. Never accept worker/session,
   // lifecycle/counters/policy/governance data from a revisioned projection.
   const backfill: Record<string, unknown> = {};
-  for (const key of ['permissions_snapshot', 'leader_cwd', 'team_state_root', 'workspace_mode', 'worktree_mode', 'lifecycle_profile', 'leader_pane_id', 'hud_pane_id', 'resize_hook_name', 'resize_hook_target']) {
+  for (const key of ['permissions_snapshot', 'leader_cwd', 'team_state_root', 'workspace_mode', 'worktree_mode', 'lifecycle_profile', 'leader_pane_id', 'hud_pane_id', 'resize_hook_name', 'resize_hook_target', 'resolved_routing', 'resolved_routing_roles', 'external_models_defaults']) {
     if ((config as unknown as Record<string, unknown>)[key] === undefined && projected[key] !== undefined) backfill[key] = projected[key];
   }
   return { ...backfill, ...config, tmux_session: config.tmux_session } as TeamConfig;
@@ -92,7 +92,10 @@ export function deriveManifestProjection(config: TeamConfig, existing?: TeamMani
     schema_version: 2,
     name: config.name,
     task: config.task,
-    leader: { ...(source?.leader ?? { worker_id: 'leader', role: 'leader' }), session_id: config.tmux_session },
+    leader: {
+      ...(source?.leader ?? { worker_id: 'leader', role: 'leader' }),
+      session_id: config.leader_session_id ?? config.tmux_session,
+    },
     policy: config.policy ?? source?.policy ?? { display_mode: 'split_pane', worker_launch_mode: config.worker_launch_mode, dispatch_mode: 'hook_preferred_with_fallback', dispatch_ack_timeout_ms: 3000 },
     governance: config.governance ?? source?.governance ?? { delegation_only: false, plan_approval_required: false, nested_teams_allowed: false, one_team_per_leader_session: false, cleanup_requires_all_workers_inactive: false },
     permissions_snapshot: source?.permissions_snapshot ?? { approval_mode: 'default', sandbox_mode: 'default', network_access: false },
@@ -111,6 +114,9 @@ export function deriveManifestProjection(config: TeamConfig, existing?: TeamMani
     resize_hook_name: config.resize_hook_name,
     resize_hook_target: config.resize_hook_target,
     next_worker_index: config.next_worker_index,
+    resolved_routing: config.resolved_routing ?? source?.resolved_routing,
+    resolved_routing_roles: config.resolved_routing_roles ?? source?.resolved_routing_roles,
+    external_models_defaults: config.external_models_defaults ?? source?.external_models_defaults,
     // Retain revision in the durable projection although old manifest typings predate it.
     state_revision: config.state_revision,
   } as TeamManifestV2;

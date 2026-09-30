@@ -9,9 +9,10 @@
  * All modes store state in `.omc/state/` subdirectory for consistency.
  */
 import { existsSync, readFileSync, mkdirSync, readdirSync, statSync, rmdirSync, rmSync, } from "fs";
-import { canClearStateForSession, clearStateFileLockedIf, writeStateFileLocked } from "../../lib/mode-state-io.js";
+import { canClearStateForSession, clearStateFileLockedIf, getStateMutationLockFailureMessage, writeStateFileLocked } from "../../lib/mode-state-io.js";
 import { join, dirname } from "path";
-import { listSessionIds, resolveSessionStatePath, getSessionStateDir, getOmcRoot, } from "../../lib/worktree-paths.js";
+import { listSessionIds, resolveSessionStatePath, getSessionStateDir, getOmcRoot, } from '../../lib/worktree-paths.js';
+import { getStateSessionOwner } from '../../lib/mode-state-io.js';
 import { MODE_STATE_FILE_MAP, MODE_NAMES } from "../../lib/mode-names.js";
 /**
  * Mode configuration registry
@@ -43,17 +44,6 @@ const MODE_CONFIGS = {
         markerFile: "ralph-verification.json",
         activeProperty: "active",
         hasGlobalState: false,
-    },
-    [MODE_NAMES.ULTRAWORK]: {
-        name: "Ultrawork",
-        stateFile: MODE_STATE_FILE_MAP[MODE_NAMES.ULTRAWORK],
-        activeProperty: "active",
-        hasGlobalState: false,
-    },
-    [MODE_NAMES.ULTRAQA]: {
-        name: "UltraQA",
-        stateFile: MODE_STATE_FILE_MAP[MODE_NAMES.ULTRAQA],
-        activeProperty: "active",
     },
     [MODE_NAMES.DEEP_INTERVIEW]: {
         name: "Deep Interview",
@@ -185,7 +175,8 @@ function isJsonModeActive(cwd, mode, sessionId) {
             const content = readFileSync(sessionStateFile, "utf-8");
             const state = JSON.parse(content);
             // Validate session identity: state must belong to this session
-            if (state.session_id && state.session_id !== sessionId) {
+            const ownerSessionId = getStateSessionOwner(state);
+            if (ownerSessionId && ownerSessionId !== sessionId) {
                 return false;
             }
             if (config.activeProperty) {
@@ -205,6 +196,9 @@ function isJsonModeActive(cwd, mode, sessionId) {
     try {
         const content = readFileSync(stateFile, "utf-8");
         const state = JSON.parse(content);
+        if (getStateSessionOwner(state)) {
+            return false;
+        }
         if (config.activeProperty) {
             return state[config.activeProperty] === true;
         }
@@ -304,11 +298,23 @@ export function canStartMode(mode, cwd) {
  * @returns Array of mode statuses
  */
 export function getAllModeStatuses(cwd, sessionId) {
-    return Object.keys(MODE_CONFIGS).map((mode) => ({
-        mode,
-        active: isModeActive(mode, cwd, sessionId),
-        stateFilePath: getStateFilePath(cwd, mode, sessionId),
-    }));
+    return Object.keys(MODE_CONFIGS).map((mode) => {
+        const stateFilePath = getStateFilePath(cwd, mode, sessionId);
+        const raw = (() => {
+            try {
+                return JSON.parse(readFileSync(stateFilePath, 'utf8'));
+            }
+            catch {
+                return null;
+            }
+        })();
+        const owner = raw ? getStateSessionOwner(raw) : undefined;
+        return {
+            mode,
+            active: isModeActive(mode, cwd, sessionId) && (sessionId ? (!owner || owner === sessionId) : !owner),
+            stateFilePath,
+        };
+    });
 }
 function clearObservedJsonFile(filePath, predicate = () => true) {
     if (!existsSync(filePath))
@@ -371,7 +377,7 @@ export function clearModeState(mode, cwd, sessionId, expectedState) {
         try {
             const result = clearStateFileLockedIf(sessionStateFile, (current) => canClearStateForSession(current, sessionId) && (!expectedState || JSON.stringify(current) === JSON.stringify(expectedState)));
             if (result === 'failed' || (result === 'skipped' && existsSync(sessionStateFile)))
-                throw new Error("state mutation lock unavailable");
+                throw new Error(getStateMutationLockFailureMessage());
         }
         catch (err) {
             if (err.code !== "ENOENT") {
@@ -383,7 +389,7 @@ export function clearModeState(mode, cwd, sessionId, expectedState) {
         if (sessionMarkerFile) {
             try {
                 if (!clearDiscoveredJsonFile(sessionMarkerFile, sessionMarkerSnapshot, (current) => canClearStateForSession(current, sessionId)))
-                    throw new Error("state mutation lock unavailable");
+                    throw new Error(getStateMutationLockFailureMessage());
             }
             catch (err) {
                 if (err.code !== "ENOENT") {
@@ -400,7 +406,7 @@ export function clearModeState(mode, cwd, sessionId, expectedState) {
                 if (!markerSessionId || markerSessionId === sessionId) {
                     try {
                         if (!clearDiscoveredJsonFile(markerFile, markerSnapshot, (current) => canClearStateForSession(current, sessionId)))
-                            throw new Error("state mutation lock unavailable");
+                            throw new Error(getStateMutationLockFailureMessage());
                     }
                     catch (err) {
                         if (err.code !== "ENOENT") {
@@ -413,7 +419,7 @@ export function clearModeState(mode, cwd, sessionId, expectedState) {
                 // Malformed or unreadable session-scoped markers fail closed.
                 try {
                     if (!clearDiscoveredJsonFile(markerFile, markerSnapshot, (current) => canClearStateForSession(current, sessionId)))
-                        throw new Error("state mutation lock unavailable");
+                        throw new Error(getStateMutationLockFailureMessage());
                 }
                 catch (err) {
                     if (err.code !== "ENOENT") {
@@ -429,7 +435,7 @@ export function clearModeState(mode, cwd, sessionId, expectedState) {
         try {
             const result = clearStateFileLockedIf(stateFile, (current) => !expectedState || JSON.stringify(current) === JSON.stringify(expectedState));
             if (result === 'failed' || (result === 'skipped' && existsSync(stateFile)))
-                throw new Error("state mutation lock unavailable");
+                throw new Error(getStateMutationLockFailureMessage());
         }
         catch (err) {
             if (err.code !== "ENOENT") {
@@ -441,7 +447,7 @@ export function clearModeState(mode, cwd, sessionId, expectedState) {
     if (markerFile && !isSessionScopedClear) {
         try {
             if (!clearDiscoveredJsonFile(markerFile, markerSnapshot))
-                throw new Error("state mutation lock unavailable");
+                throw new Error(getStateMutationLockFailureMessage());
         }
         catch (err) {
             if (err.code !== "ENOENT")
@@ -465,7 +471,7 @@ export function clearAllModeStates(cwd) {
     const skillStatePath = join(getStateDir(cwd), "skill-active-state.json");
     try {
         if (!clearObservedJsonFile(skillStatePath))
-            throw new Error("state mutation lock unavailable");
+            throw new Error(getStateMutationLockFailureMessage());
     }
     catch (err) {
         if (err.code !== "ENOENT") {

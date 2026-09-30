@@ -1,8 +1,8 @@
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import { buildProviderSpawnInvocation, materializeProviderSpawnInvocation, withWorkerLaunchAttemptFence } from './worker-launch-ack.js';
-import { getProcessStartIdentitySync, isProcessAlive, terminateOwnedProcessTree } from '../platform/process-utils.js';
+import { buildProviderSpawnInvocation, buildWorkerLaunchBootstrapSpec, materializeProviderSpawnInvocation, readProviderCompletionExitCode, withWorkerLaunchAttemptFence, WORKER_LAUNCH_RECOVERY_GATE_CONTAINED_ENV, } from './worker-launch-ack.js';
+import { captureOwnedProcessGroup, getProcessStartIdentitySync, isProcessAlive, terminateOwnedProcessTree } from '../platform/process-utils.js';
 async function writeAtomic(path, value) {
     await mkdir(dirname(path), { recursive: true });
     const temporary = `${path}.tmp.${process.pid}.${Date.now()}`;
@@ -32,9 +32,10 @@ export async function waitForRecoveryGateRecord(path, expected, timeoutMs, pollI
 export async function runWorkerActivationGate(gate) {
     if (gate.providerArgv.length === 0 || !gate.providerArgv[0])
         return { outcome: 'invalid_provider_argv' };
-    const launchContext = gate.launchAttempt?.context;
-    if (!gate.launchAttempt || launchContext?.kind !== 'recovery'
-        || gate.launchAttempt.worker_name !== gate.workerName
+    const launchAttempt = gate.launchAttempt;
+    const launchContext = launchAttempt?.context;
+    if (!launchAttempt || launchContext?.kind !== 'recovery'
+        || launchAttempt.worker_name !== gate.workerName
         || launchContext.recovery_id !== gate.recoveryId
         || launchContext.replacement_generation !== gate.replacementGeneration
         || launchContext.pane_attempt_id !== gate.paneAttemptId)
@@ -46,8 +47,8 @@ export async function runWorkerActivationGate(gate) {
         worker_name: gate.workerName,
         replacement_generation: gate.replacementGeneration,
         pane_attempt_id: gate.paneAttemptId,
-        launch_attempt_id: gate.launchAttempt.attempt_id,
-        launch_nonce: gate.launchAttempt.nonce,
+        launch_attempt_id: launchAttempt.attempt_id,
+        launch_nonce: launchAttempt.nonce,
         written_at: new Date().toISOString(),
     };
     const timeoutMs = gate.timeoutMs ?? 30_000;
@@ -59,20 +60,29 @@ export async function runWorkerActivationGate(gate) {
     await writeAtomic(`${gate.readyPath}.adoption-ready`, { ...expected, written_at: new Date().toISOString() });
     if (!await waitForRecoveryGateRecord(gate.runPath, expected, timeoutMs, pollIntervalMs))
         return { outcome: 'run_timeout' };
-    const fenced = await withWorkerLaunchAttemptFence(gate.launchAttempt, async () => {
-        const { OMC_RECOVERY_GATE_SPEC: _recoveryGateSpec, OMC_RECOVERY_GATE_SPEC_B64: _encodedRecoveryGateSpec, ...providerProcessEnv } = process.env;
+    const fenced = await withWorkerLaunchAttemptFence(launchAttempt, async () => {
+        const { OMC_RECOVERY_GATE_SPEC: _recoveryGateSpec, OMC_RECOVERY_GATE_SPEC_B64: _encodedRecoveryGateSpec, [WORKER_LAUNCH_RECOVERY_GATE_CONTAINED_ENV]: containedByBootstrap, ...providerProcessEnv } = process.env;
+        const containedByDurableBootstrap = containedByBootstrap === '1';
+        const providerEnv = { ...providerProcessEnv, ...gate.env };
+        delete providerEnv[WORKER_LAUNCH_RECOVERY_GATE_CONTAINED_ENV];
         const invocation = await materializeProviderSpawnInvocation(buildProviderSpawnInvocation(gate.providerArgv), {
             superviseProcessTree: true,
+            completionIdentity: buildWorkerLaunchBootstrapSpec(launchAttempt, gate.providerArgv, gate.cwd, { providerEnv }),
         });
         const child = spawn(invocation.command, invocation.args, {
             cwd: gate.cwd,
-            env: { ...providerProcessEnv, ...gate.env },
+            env: providerEnv,
             stdio: 'inherit',
-            detached: process.platform !== 'win32',
+            // A recovery gate already runs inside the durable worker-launch
+            // bootstrap group. Keep the actual provider in that group so teardown's
+            // group-absence proof covers the provider rather than only the gate.
+            // Direct gate callers retain the pre-bootstrap detached cleanup path.
+            detached: process.platform !== 'win32' && !containedByDurableBootstrap,
         });
         let settled = false;
         let providerPid;
         let providerStartIdentity = null;
+        let providerProcessGroupId;
         let supervisedExitCode = null;
         let supervisorTimer;
         let terminationResult = null;
@@ -86,6 +96,7 @@ export async function runWorkerActivationGate(gate) {
                     clearInterval(supervisorTimer);
                 try {
                     await writeAtomic(`${gate.runPath}.terminal`, { ...expected, provider_pid: child.pid ?? null, ...terminal,
+                        ...(providerProcessGroupId !== undefined ? { process_group_id: providerProcessGroupId } : {}),
                         written_at: new Date().toISOString() });
                 }
                 catch { /* owner may have already cleaned terminal attempt state */ }
@@ -180,10 +191,24 @@ export async function runWorkerActivationGate(gate) {
             // Bind identity IMMEDIATELY after spawn, before any await that races exit/PID reuse.
             providerPid = child.pid;
             providerStartIdentity = providerPid ? getProcessStartIdentitySync(providerPid) : null;
+            providerProcessGroupId = providerPid ? captureOwnedProcessGroup(providerPid)?.processGroupId : undefined;
             if (!providerPid || !providerStartIdentity || settled || !isProcessAlive(providerPid)) {
                 if (!await terminateProvider())
                     return { outcome: 'provider_cleanup_unverified' };
                 return { outcome: 'provider_spawn_failed' };
+            }
+            if (!providerProcessGroupId) {
+                if (!await terminateProvider())
+                    return { outcome: 'provider_cleanup_unverified' };
+                return { outcome: 'provider_spawn_failed' };
+            }
+            if (containedByDurableBootstrap) {
+                const gateProcessGroupId = captureOwnedProcessGroup(process.pid)?.processGroupId;
+                if (!gateProcessGroupId || gateProcessGroupId !== providerProcessGroupId) {
+                    if (!await terminateProvider())
+                        return { outcome: 'provider_cleanup_unverified' };
+                    return { outcome: 'provider_cleanup_unverified' };
+                }
             }
             await new Promise(resolve => setTimeout(resolve, 150));
             if (settled)
@@ -195,8 +220,8 @@ export async function runWorkerActivationGate(gate) {
                 return { outcome: 'provider_spawn_failed' };
             }
             if (invocation.completionPath && await readFile(invocation.completionPath, 'utf8').then(() => true).catch(() => false)) {
-                const exitCode = Number(await readFile(invocation.completionPath, 'utf8').catch(() => ''));
-                if (Number.isSafeInteger(exitCode))
+                const exitCode = await readProviderCompletionExitCode(invocation.completionPath, invocation.completionBinding);
+                if (exitCode !== undefined)
                     supervisedExitCode = exitCode;
                 if (!await terminateProvider())
                     return { outcome: 'provider_cleanup_unverified' };
@@ -206,6 +231,7 @@ export async function runWorkerActivationGate(gate) {
                 ...expected,
                 provider_pid: providerPid,
                 provider_start_identity: providerStartIdentity,
+                process_group_id: providerProcessGroupId,
                 written_at: new Date().toISOString(),
                 ...(invocation.completionPath ? { supervisor_completion_path: invocation.completionPath } : {}),
             });
@@ -215,9 +241,9 @@ export async function runWorkerActivationGate(gate) {
                     if (pollingCompletion || settled || !providerStartIdentity || !providerPid)
                         return;
                     pollingCompletion = true;
-                    void readFile(invocation.completionPath, 'utf8').then(async (raw) => {
-                        const exitCode = Number(raw.trim());
-                        if (!Number.isSafeInteger(exitCode))
+                    void readFile(invocation.completionPath, 'utf8').then(async () => {
+                        const exitCode = await readProviderCompletionExitCode(invocation.completionPath, invocation.completionBinding);
+                        if (exitCode === undefined)
                             return;
                         supervisedExitCode = exitCode;
                         const cleaned = await terminateProvider();

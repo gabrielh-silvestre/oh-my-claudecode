@@ -6,7 +6,28 @@
 import type { TeamTaskStatus } from './contracts.js';
 import type { TeamPhase } from './phase-controller.js';
 import type { TeamLeaderNextAction } from './leader-nudge-guidance.js';
-import type { CanonicalTeamRole, RoleAssignment } from '../shared/types.js';
+import type { CanonicalTeamRole, ExternalModelsDefaults, RoleAssignment } from '../shared/types.js';
+/**
+ * Immutable identity of the tmux server incarnation selected for a team.
+ *
+ * The socket path is captured from tmux itself rather than reconstructed from
+ * ambient environment state.  `process_started_at` is a strict native
+ * process-creation token (not a coarse wall-clock timestamp).
+ */
+export interface TmuxServerIdentity {
+    socket_path: string;
+    server_pid: number;
+    process_started_at: string;
+}
+/** Structural validation for persisted or caller-supplied tmux identities. */
+export declare function isValidTmuxServerIdentity(value: unknown): value is TmuxServerIdentity;
+/** Immutable UUID identifying one incarnation of a named team. */
+export type TeamInstanceId = string;
+export declare const TEAM_INSTANCE_ID_PATTERN: RegExp;
+export declare function isValidTeamInstanceId(value: unknown): value is TeamInstanceId;
+/** Claude/OMC session id stored as team ownership, never a tmux target. */
+export declare const LEADER_SESSION_ID_PATTERN: RegExp;
+export declare function isValidLeaderSessionId(value: unknown): value is string;
 /** Bridge daemon configuration — passed via --config file to bridge-entry.ts */
 export interface BridgeConfig {
     teamName: string;
@@ -164,6 +185,7 @@ export interface TeamTask {
     owner?: string;
     result?: string;
     error?: string;
+    metadata?: Record<string, unknown>;
     blocked_by?: string[];
     depends_on?: string[];
     version?: number;
@@ -301,6 +323,8 @@ export interface TeamRuntimeOwnerEpoch {
 }
 /** Durable lifecycle fence for a scale-up operation. */
 export interface TeamScaleUpAttempt {
+    /** Missing on older records, which cannot authorize instance-bound effects. */
+    instance_id?: TeamInstanceId;
     operation_id: string;
     phase: 'reserved' | 'effects' | 'committed' | 'failed';
     pid: number;
@@ -375,6 +399,10 @@ export interface TeamManifestV2 {
     schema_version: 2;
     state_revision?: number;
     name: string;
+    /** Immutable team incarnation. Legacy manifests may omit this for reads only. */
+    instance_id?: TeamInstanceId;
+    /** Immutable tmux server incarnation; absent for CMUX and legacy evidence. */
+    tmux_server_identity?: TmuxServerIdentity;
     task: string;
     leader: TeamLeader;
     policy: TeamTransportPolicy;
@@ -395,6 +423,12 @@ export interface TeamManifestV2 {
     resize_hook_name: string | null;
     resize_hook_target: string | null;
     next_worker_index?: number;
+    resolved_routing?: Record<CanonicalTeamRole, {
+        primary: RoleAssignment;
+        fallback: RoleAssignment;
+    }>;
+    resolved_routing_roles?: CanonicalTeamRole[];
+    external_models_defaults?: ExternalModelsDefaults;
     service_descriptor?: TeamServiceDescriptor;
 }
 /** Worker info within a team config */
@@ -415,8 +449,8 @@ export interface WorkerInfo {
     team_state_root?: string;
     /**
      * Verdict-output file path for CLI-worker output contract (AC-7).
-     * Set when the worker was spawned for a reviewer role on codex/gemini/grok.
-     * Consumed by the worker-completion handler in runtime-v2.
+     * Set when the worker was spawned for a reviewer role on any non-Claude
+     * provider. Consumed by the worker-completion handler in runtime-v2.
      */
     output_file?: string;
     recovery_id?: string;
@@ -427,6 +461,8 @@ export interface WorkerInfo {
     launch_descriptor?: WorkerLaunchDescriptor;
 }
 export interface TeamScaleDownAttempt {
+    /** Missing on older records, which cannot authorize instance-bound effects. */
+    instance_id?: TeamInstanceId;
     operation_id: string;
     phase: 'draining' | 'effects' | 'failed';
     pid: number;
@@ -436,6 +472,9 @@ export interface TeamScaleDownAttempt {
         pane_id?: string;
         worktree_path?: string;
         worktree_created?: boolean;
+        launch_attempt_id?: string;
+        provider?: WorkerInfo['worker_cli'];
+        launch_descriptor?: WorkerLaunchDescriptor;
     }>;
     state_revision: number;
     created_at: string;
@@ -443,6 +482,8 @@ export interface TeamScaleDownAttempt {
     failure_reason?: string;
 }
 export interface TeamShutdownAttempt {
+    /** Required by instance-bound shutdown; older records are read-only evidence. */
+    instance_id?: TeamInstanceId;
     nonce: string;
     pid: number;
     process_started_at: string;
@@ -452,6 +493,10 @@ export interface TeamShutdownAttempt {
 /** Team configuration (V1 compat) */
 export interface TeamConfig {
     name: string;
+    /** Immutable team incarnation. Legacy configs may omit this for reads only. */
+    instance_id?: TeamInstanceId;
+    /** Immutable tmux server incarnation; absent for CMUX and legacy evidence. */
+    tmux_server_identity?: TmuxServerIdentity;
     task: string;
     agent_type: string;
     worker_launch_mode: 'interactive' | 'prompt';
@@ -464,6 +509,11 @@ export interface TeamConfig {
     tmux_session: string;
     tmux_window_owned?: boolean;
     next_task_id: number;
+    /**
+     * Claude/OMC session that started this team. Distinct from `tmux_session`.
+     * SessionEnd cleanup authorizes against this field, not the tmux target.
+     */
+    leader_session_id?: string;
     leader_cwd?: string;
     team_state_root?: string;
     workspace_mode?: 'single' | 'worktree';
@@ -483,6 +533,10 @@ export interface TeamConfig {
         primary: RoleAssignment;
         fallback: RoleAssignment;
     }>;
+    /** Canonical roles explicitly configured for routing; defaults are not opt-in routes. */
+    resolved_routing_roles?: CanonicalTeamRole[];
+    /** Immutable provider defaults captured at team creation for scale-up parity. */
+    external_models_defaults?: ExternalModelsDefaults;
     state_revision?: number;
     runtime_owner_epoch?: TeamRuntimeOwnerEpoch;
     active_recovery?: TeamRecoveryAttempt;
@@ -495,8 +549,94 @@ export interface TeamConfig {
         state_revision: number;
     };
     service_descriptor?: TeamServiceDescriptor;
-    lifecycle_state?: 'active' | 'shutting_down' | 'stopped';
+    lifecycle_state?: 'starting' | 'active' | 'shutting_down' | 'stopped';
     shutdown_attempt?: TeamShutdownAttempt;
+}
+/** Caller input for creating or addressing one team incarnation. */
+export interface TeamInstanceRequest {
+    teamName: string;
+    cwd: string;
+    /** CLI/MCP callers provide this before spawning; direct callers may omit it. */
+    instanceId?: TeamInstanceId;
+}
+/** Canonical immutable binding shared by every producer and destructive consumer. */
+export interface TeamInstanceBinding {
+    instance_id: TeamInstanceId;
+    team_name: string;
+    cwd: string;
+    workspace_hash: string;
+    state_root: string;
+}
+export interface TeamInstanceProcessIdentity {
+    pid: number;
+    process_started_at: string;
+    nonce: string;
+}
+export type TeamInstanceReservationPhase = 'pending' | 'active';
+/** Durable external startup reservation (kept outside the disposable state root). */
+export interface TeamInstanceReservation {
+    schema_version: 1;
+    kind: 'team-instance-reservation';
+    instance_id: TeamInstanceId;
+    team_name: string;
+    cwd: string;
+    workspace_hash: string;
+    state_root: string;
+    phase: TeamInstanceReservationPhase;
+    owner: TeamInstanceProcessIdentity;
+    reservation_path: string;
+    lifecycle_lock_path: string;
+    created_at: string;
+    updated_at: string;
+}
+/** Minimal config projection that may be persisted while effects are pending. */
+export type TeamInstancePendingConfig = Pick<TeamConfig, 'name' | 'instance_id' | 'leader_cwd' | 'team_state_root' | 'lifecycle_state'> & {
+    name: string;
+    instance_id: TeamInstanceId;
+    leader_cwd: string;
+    team_state_root: string;
+    lifecycle_state: 'starting';
+};
+/**
+ * Explicit caller-owned proof that provider/pane/worktree teardown has already
+ * completed. The instance module never infers provider death from a pane.
+ */
+export interface TeamInstanceDisposalAuthorization {
+    protocol: 'caller-owned-final-state-v1';
+    providers: 'disposed';
+    panes: 'disposed';
+    worktrees: 'disposed';
+}
+export type TeamInstanceCleanupPhase = 'prepared' | 'detached' | 'removing' | 'failed' | 'completed';
+/** Durable external cleanup authority for one immutable team instance. */
+export interface TeamInstanceCleanupRecord {
+    schema_version: 1;
+    kind: 'team-instance-cleanup';
+    instance_id: TeamInstanceId;
+    team_name: string;
+    cwd: string;
+    workspace_hash: string;
+    state_root: string;
+    detached_root: string;
+    receipt_path: string;
+    phase: TeamInstanceCleanupPhase;
+    /** Set only after the original state root has been durably renamed. */
+    detached_at?: string;
+    authorization: TeamInstanceDisposalAuthorization;
+    created_at: string;
+    updated_at: string;
+    failure_reason?: string;
+}
+export type TeamInstanceObservedState = 'missing' | 'empty' | 'bound';
+export interface TeamInstanceAssertion {
+    binding: TeamInstanceBinding;
+    reservation: TeamInstanceReservation;
+    observed_state: TeamInstanceObservedState;
+}
+export interface TeamInstanceCleanupResult {
+    outcome: 'cleaned' | 'already_cleaned';
+    binding: TeamInstanceBinding;
+    receipt: TeamInstanceCleanupRecord;
 }
 /** Dispatch request kinds */
 export type TeamDispatchRequestKind = 'inbox' | 'mailbox' | 'nudge';
@@ -548,6 +688,10 @@ export interface TeamEvent {
     reason?: string;
     next_action?: TeamLeaderNextAction;
     message?: string;
+    /** Undelivered directed messages addressed TO the worker (issue #3662). */
+    undelivered_inbound_count?: number;
+    /** Undelivered directed messages FROM the worker (owed reports/acks, issue #3662). */
+    undelivered_outbound_count?: number;
     created_at: string;
 }
 /** Mailbox message between workers */

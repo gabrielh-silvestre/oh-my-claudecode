@@ -8,6 +8,10 @@ import { readRecoveryOutcome, reserveRecoveryRequest } from '../recovery-request
 import type { TeamTask } from '../types.js';
 
 let cwd: string;
+let previousHome: string | undefined;
+let previousUserProfile: string | undefined;
+let previousOmcStateDir: string | undefined;
+const TEAM_INSTANCE_ID = '33333333-3333-4333-8333-333333333333';
 const input: RecoverySagaInput = {
   requestId: 'request-a',
   recoveryId: 'recovery-a',
@@ -28,10 +32,24 @@ const task = {
 
 beforeEach(() => {
   cwd = mkdtempSync(join(tmpdir(), 'omc-recovery-saga-'));
+  previousHome = process.env.HOME;
+  previousUserProfile = process.env.USERPROFILE;
+  previousOmcStateDir = process.env.OMC_STATE_DIR;
+  process.env.HOME = cwd;
+  process.env.USERPROFILE = cwd;
+  delete process.env.OMC_STATE_DIR;
   reserveRecoveryRequest(cwd, input.requestId, { operation: 'recover-worker', workspaceHash: 'a'.repeat(64),
-    teamName: input.teamName, workerName: input.workerName }, input.recoveryId);
+    teamName: input.teamName, workerName: input.workerName, instanceId: TEAM_INSTANCE_ID }, input.recoveryId);
 });
-afterEach(() => { rmSync(cwd, { recursive: true, force: true }); });
+afterEach(() => {
+  if (previousHome === undefined) delete process.env.HOME;
+  else process.env.HOME = previousHome;
+  if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = previousUserProfile;
+  if (previousOmcStateDir === undefined) delete process.env.OMC_STATE_DIR;
+  else process.env.OMC_STATE_DIR = previousOmcStateDir;
+  rmSync(cwd, { recursive: true, force: true });
+});
 
 function dependencies(order: string[], overrides: Partial<RecoverySagaDependencies> = {}): RecoverySagaDependencies {
   return {
@@ -101,6 +119,21 @@ describe('recovery saga ordering and rollback contract', () => {
 
     expect(result).toMatchObject({ outcome: 'recovered', committed: true, oldPaneId: '%old-worker-pane', newPaneId: '%9' });
     expect(order).toEqual(['liveness', 'list', 'validate', 'requeue', 'spawn', 'activate', 'adopt', 'repair', 'run:new-claim']);
+    expect(order).not.toContain('kill');
+  });
+
+  it('surfaces provider startup rejection after commit without repeating persistence or killing the replacement', async () => {
+    const order: string[] = [];
+    await expect(runRecoverySaga(input, dependencies(order, {
+      spawnGatedPane: async () => {
+        order.push('spawn');
+        return { ok: true, paneId: '%9', paneAttemptId: 'attempt-a', committed: true, stateRevision: 8, manifestSync: 'synced' };
+      },
+      persistActive: async () => { order.push('persist'); throw new Error('must not persist committed pane'); },
+      writeRun: async () => { order.push('run'); throw new Error('startup_evidence_missing'); },
+    }))).rejects.toThrow('startup_evidence_missing');
+    expect(order).toEqual(['liveness', 'list', 'validate', 'requeue', 'spawn', 'activate', 'adopt', 'repair', 'run']);
+    expect(order).not.toContain('persist');
     expect(order).not.toContain('kill');
   });
 

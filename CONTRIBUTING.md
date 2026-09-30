@@ -84,6 +84,11 @@ Note: The repo has two main branches:
 
 All TypeScript and bundling steps are handled. The output goes to `dist/` and `bridge/`.
 
+On macOS, the graph filesystem backend also requires clang and Node development
+headers and produces ignored binaries in `native/`. See
+[Graph contained filesystem](docs/graph-contained-filesystem.md) for header
+configuration, packaging, and the real-host acceptance checks.
+
 ---
 
 ## 4. Linking Your Checkout as the Active OMC Plugin
@@ -130,6 +135,11 @@ This tells Claude Code to ignore the repo's `.mcp.json` entry and use the plugin
 ```bash
 /autopilot "your task here"
 ```
+
+**Quick verification**: if Claude Code starts without OMC agents or the bridge MCP, run
+`omc doctor conflicts` first. A missing `disabledMcpjsonServers` entry usually shows up as a duplicate
+`"t"` MCP server, while a stale checkout setup is fixed by re-running `omc setup --plugin-dir-mode`
+from the repository root.
 
 **Rebuilding**: After code changes:
 ```bash
@@ -451,6 +461,6 @@ Or check the troubleshooting sections in:
 - **Local Plugin Install**: [docs/LOCAL_PLUGIN_INSTALL.md](./docs/LOCAL_PLUGIN_INSTALL.md)
 - **Getting Started**: [docs/GETTING-STARTED.md](./docs/GETTING-STARTED.md)
 - **GitHub Issues**: https://github.com/Yeachan-Heo/oh-my-claudecode/issues
-- **Discord Community**: https://discord.gg/jq6jnSGABY
+- **Discord Community**: https://discord.gg/wSyUQYfhAw
 
 Happy contributing!

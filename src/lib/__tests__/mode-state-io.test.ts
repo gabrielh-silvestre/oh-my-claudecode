@@ -1,27 +1,72 @@
 import { createHash, randomUUID } from 'crypto';
-import { execSync, spawn } from 'child_process';
+import { execFileSync, execSync, spawn } from 'child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync, mkdtempSync, unlinkSync } from 'fs';
+import { cpSync, mkdirSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync, mkdtempSync, unlinkSync } from 'fs';
 import { basename, dirname, join } from 'path';
 import { tmpdir } from 'os';
 
-import { emergencyMutateStateFileIf, recoverEmergencyStateFile, writeModeState, readModeState, clearModeStateFile } from '../mode-state-io.js';
-import { clearWorktreeCache, getProjectIdentifier } from '../worktree-paths.js';
+import { emergencyMutateStateFileIf, recoverEmergencyStateFile, captureModeStateCleanup, findSessionOwnedStateCandidates, getStateMutationLockDiagnostic, writeModeState, readModeState, readModeStateWithMeta, clearModeStateFile, withStateFileMutationLock } from '../mode-state-io.js';
+import { atomicWriteJsonSync } from '../atomic-write.js';
+import { clearWorktreeCache, getOmcRoot, getProjectIdentifier } from '../worktree-paths.js';
+import { getProcessStartIdentitySync } from '../../platform/process-utils.js';
+import { pathToFileURL } from 'node:url';
+import { provisionStandaloneStateLockBridge } from '../../installer/index.js';
+
+async function installedAtomicHelper() {
+  const hooks = join(tempDir, 'installed-hooks');
+  cpSync(join(process.cwd(), 'templates', 'hooks'), hooks, { recursive: true });
+  provisionStandaloneStateLockBridge(process.cwd(), join(hooks, 'lib', 'state-lock.mjs'));
+  return import(pathToFileURL(join(hooks, 'lib', 'atomic-write.mjs')).href);
+}
+
 
 let tempDir: string;
+const previousHome = process.env.HOME;
+const previousUserProfile = process.env.USERPROFILE;
 
+function currentProcessStart(): string {
+  const identity = getProcessStartIdentitySync(process.pid);
+  if (identity === null) throw new Error('current process identity unavailable');
+  return identity;
+}
 describe('mode-state-io', () => {
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), 'mode-state-io-test-'));
+    process.env.HOME = tempDir;
+    process.env.USERPROFILE = tempDir;
     clearWorktreeCache();
+  });
+
+  it('keeps a non-Git cwd in the non-git centralized namespace when HOME is Git-backed', () => {
+    const homeRepo = join(tempDir, 'home-repo');
+    const nonGitCwd = join(tempDir, 'non-git-cwd');
+    const centralized = join(tempDir, 'centralized-state');
+    mkdirSync(homeRepo, { recursive: true });
+    mkdirSync(nonGitCwd, { recursive: true });
+    execFileSync('git', ['init'], { cwd: homeRepo, stdio: 'pipe' });
+    process.env.HOME = homeRepo;
+    process.env.USERPROFILE = homeRepo;
+    process.env.OMC_STATE_DIR = centralized;
+    clearWorktreeCache();
+
+    expect(writeModeState('ralph', { active: true }, nonGitCwd, 'home-git-session')).toBe(true);
+    expect(readModeState('ralph', nonGitCwd, 'home-git-session')).toMatchObject({ active: true });
+    expect(getOmcRoot(nonGitCwd)).toBe(join(centralized, 'non-git'));
+    expect(existsSync(join(centralized, 'non-git', 'state', 'sessions', 'home-git-session', 'ralph-state.json'))).toBe(true);
   });
 
   afterEach(() => {
     rmSync(tempDir, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
     clearWorktreeCache();
     delete process.env.OMC_STATE_DIR;
     delete process.env.OMC_TEST_CONDITIONAL_CLEAR_REPLACEMENT_PATH;
     delete process.env.OMC_TEST_CONDITIONAL_CLEAR_REPLACEMENT_BASE64;
+    delete process.env.OMC_TEST_GENERATION_CLEAR_REPLACEMENT_PATH;
+    delete process.env.OMC_TEST_GENERATION_CLEAR_REPLACEMENT_BASE64;
     delete process.env.OMC_TEST_FLOCK_AVAILABLE;
     delete process.env.OMC_TEST_EMERGENCY_CRASH_PHASE;
     delete process.env.OMC_TEST_EMERGENCY_REPLACEMENT_PATH;
@@ -108,7 +153,31 @@ describe('mode-state-io', () => {
       expect(existsSync(join(tempDir, '.omc', 'state', 'autopilot-state.json.mutation.lock'))).toBe(false);
     });
 
-    it('bypasses abandoned generic lock artifacts without flock', () => {
+    it('supports exclusive mutations without external flock when SQLite is available', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.OMC_TEST_FLOCK_AVAILABLE = '0';
+      const statePath = join(tempDir, '.omc', 'state', 'ralph-prd.json');
+
+      expect(withStateFileMutationLock(statePath, () => true, true)).toEqual({
+        acquired: true,
+        value: true,
+      });
+      expect(existsSync(`${statePath}.mutation.lock`)).toBe(false);
+    });
+
+    it('uses one state-root SQLite lock database for nested session paths when available', () => {
+      const statePath = join(tempDir, '.omc', 'state', 'sessions', 'session-a', 'autopilot-state.json');
+      mkdirSync(dirname(statePath), { recursive: true });
+      expect(withStateFileMutationLock(statePath, () => true)).toMatchObject({ acquired: true, value: true });
+      if (getStateMutationLockDiagnostic()) {
+        expect(existsSync(join(tempDir, '.omc', 'state', '.state-mutation-locks.db'))).toBe(false);
+      } else {
+        expect(existsSync(join(tempDir, '.omc', 'state', '.state-mutation-locks.db'))).toBe(true);
+      }
+      expect(existsSync(join(dirname(statePath), '.state-mutation-locks.db'))).toBe(false);
+    });
+
+    it('reclaims abandoned lock metadata under the SQLite guard', () => {
       process.env.NODE_ENV = 'test';
       process.env.OMC_TEST_FLOCK_AVAILABLE = '0';
       const statePath = join(tempDir, '.omc', 'state', 'autopilot-state.json');
@@ -116,22 +185,21 @@ describe('mode-state-io', () => {
       writeFileSync(`${statePath}.mutation.lock`, JSON.stringify({ version: 1, pid: 999999999, processStart: '1', createdAt: new Date().toISOString(), nonce: randomUUID() }));
 
       expect(writeModeState('autopilot', { active: true }, tempDir)).toBe(true);
-      expect(existsSync(`${statePath}.mutation.lock`)).toBe(true);
+      expect(existsSync(`${statePath}.mutation.lock`)).toBe(false);
     });
 
-    it('preserves legacy unlocked writes without flock when a lock artifact exists', () => {
+    it('rejects live lock metadata rather than using an unlocked fallback', () => {
       process.env.NODE_ENV = 'test';
       process.env.OMC_TEST_FLOCK_AVAILABLE = '0';
       const statePath = join(tempDir, '.omc', 'state', 'autopilot-state.json');
       mkdirSync(dirname(statePath), { recursive: true });
-      const stat = readFileSync(`/proc/${process.pid}/stat`, 'utf8');
-      const processStart = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19];
+      const processStart = currentProcessStart();
       const owner = { version: 1, pid: process.pid, processStart, createdAt: new Date().toISOString(), nonce: randomUUID() };
       writeFileSync(`${statePath}.mutation.lock`, JSON.stringify(owner));
 
-      expect(writeModeState('autopilot', { active: true }, tempDir)).toBe(true);
+      expect(writeModeState('autopilot', { active: true }, tempDir)).toBe(false);
+      expect(existsSync(statePath)).toBe(false);
       expect(existsSync(`${statePath}.mutation.lock`)).toBe(true);
-      expect(existsSync(statePath)).toBe(true);
     });
 
     it('should include sessionId in _meta when sessionId is provided', () => {
@@ -315,13 +383,49 @@ describe('mode-state-io', () => {
       const result = readModeState('ralph', tempDir);
       expect(result).toBeNull();
     });
+
+    it.each([
+      ['metadata owner', { _meta: { sessionId: 'session-other' } }],
+      ['top-level owner', { session_id: 'session-other' }],
+    ])('should reject a session-scoped state owned by another session (%s)', (_label, state) => {
+      const sessionDir = join(tempDir, '.omc', 'state', 'sessions', 'session-requester');
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(join(sessionDir, 'ralph-state.json'), JSON.stringify({ active: true, ...state }));
+
+      expect(readModeState('ralph', tempDir, 'session-requester')).toBeNull();
+      expect(readModeStateWithMeta('ralph', tempDir, 'session-requester')).toBeNull();
+    });
+
+    it.each([
+      ['same owner', { _meta: { sessionId: 'session-requester' } }],
+      ['unowned legacy', {}],
+    ])('should preserve session-scoped reads for %s state', (_label, state) => {
+      const sessionDir = join(tempDir, '.omc', 'state', 'sessions', 'session-requester');
+      mkdirSync(sessionDir, { recursive: true });
+      const persisted = { active: true, ...state };
+      writeFileSync(join(sessionDir, 'ralph-state.json'), JSON.stringify(persisted));
+
+      expect(readModeState('ralph', tempDir, 'session-requester')).toMatchObject({ active: true });
+      expect(readModeStateWithMeta('ralph', tempDir, 'session-requester')).toEqual(persisted);
+    });
+
+    it('should exclude a foreign owner from the expected session path discovery', () => {
+      const sessionDir = join(tempDir, '.omc', 'state', 'sessions', 'session-requester');
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(
+        join(sessionDir, 'ralph-state.json'),
+        JSON.stringify({ active: true, _meta: { sessionId: 'session-other' } }),
+      );
+
+      expect(findSessionOwnedStateCandidates('ralph', 'session-requester', tempDir)).toEqual([]);
+    });
   });
 
   // -----------------------------------------------------------------------
   // clearModeStateFile
   // -----------------------------------------------------------------------
   describe('clearModeStateFile', () => {
-    it('clears state without consulting stale lock artifacts when flock is unavailable', () => {
+    it('clears state after safely reclaiming stale lock metadata without flock', () => {
       process.env.NODE_ENV = 'test';
       process.env.OMC_TEST_FLOCK_AVAILABLE = '0';
       const sessionId = 'workflow-session';
@@ -338,7 +442,7 @@ describe('mode-state-io', () => {
 
       expect(clearModeStateFile('autopilot', tempDir, sessionId)).toBe(true);
       expect(existsSync(statePath)).toBe(false);
-      expect(existsSync(lockPath)).toBe(true);
+      expect(existsSync(lockPath)).toBe(false);
     });
 
     it('preserves a replacement activation during ghost-legacy cleanup', () => {
@@ -353,6 +457,56 @@ describe('mode-state-io', () => {
       expect(JSON.parse(readFileSync(legacyPath, 'utf8'))).toEqual(replacement);
     });
 
+    it('preserves same-session replacement generations published after capture', () => {
+      const sessionId = 'generation-replacement';
+      const state = { active: true, session_id: sessionId, iteration: 4, owner_pid: process.pid };
+      expect(writeModeState('ralph', state, tempDir, sessionId)).toBe(true);
+      const statePath = join(tempDir, '.omc', 'state', 'sessions', sessionId, 'ralph-state.json');
+      const captured = captureModeStateCleanup('ralph', tempDir, sessionId);
+
+      const replacement = { ...state, iteration: 5 };
+      atomicWriteJsonSync(statePath, replacement);
+
+      expect(clearModeStateFile('ralph', tempDir, sessionId, state, captured)).toBe(false);
+      expect(JSON.parse(readFileSync(statePath, 'utf8'))).toMatchObject(replacement);
+    });
+
+    it('rechecks the captured generation at the final unlink boundary', () => {
+      const sessionId = 'generation-final-boundary';
+      const state = { active: true, session_id: sessionId, iteration: 4, owner_pid: process.pid };
+      expect(writeModeState('ralph', state, tempDir, sessionId)).toBe(true);
+      const statePath = join(tempDir, '.omc', 'state', 'sessions', sessionId, 'ralph-state.json');
+      const captured = captureModeStateCleanup('ralph', tempDir, sessionId);
+      const replacement = { ...state, iteration: 6, replacement: true };
+      process.env.OMC_TEST_GENERATION_CLEAR_REPLACEMENT_PATH = statePath;
+      process.env.OMC_TEST_GENERATION_CLEAR_REPLACEMENT_BASE64 = Buffer.from(JSON.stringify(replacement)).toString('base64');
+
+      expect(clearModeStateFile('ralph', tempDir, sessionId, state, captured)).toBe(false);
+      expect(JSON.parse(readFileSync(statePath, 'utf8'))).toMatchObject(replacement);
+    });
+
+    it('leaves uncaptured runtime artifacts and legacy generations intact', () => {
+      const sessionId = 'generation-artifacts';
+      const state = { active: true, session_id: sessionId, iteration: 4, owner_pid: process.pid };
+      expect(writeModeState('ralph', state, tempDir, sessionId)).toBe(true);
+      const stateDir = join(tempDir, '.omc', 'state');
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      const artifactPath = join(sessionDir, 'ralph-stop-breaker.json');
+      const legacyPath = join(stateDir, 'ralph-state.json');
+      writeFileSync(artifactPath, JSON.stringify({ count: 1 }));
+      writeFileSync(legacyPath, JSON.stringify({ active: true, session_id: sessionId, iteration: 4 }));
+
+      const captured = captureModeStateCleanup('ralph', tempDir, sessionId);
+      const replacementArtifact = { count: 2, replacement: true };
+      const replacementLegacy = { active: true, session_id: sessionId, iteration: 5, replacement: true };
+      atomicWriteJsonSync(artifactPath, replacementArtifact);
+      atomicWriteJsonSync(legacyPath, replacementLegacy);
+
+      expect(clearModeStateFile('ralph', tempDir, sessionId, state, captured)).toBe(false);
+      expect(JSON.parse(readFileSync(artifactPath, 'utf8'))).toEqual(replacementArtifact);
+      expect(JSON.parse(readFileSync(legacyPath, 'utf8'))).toEqual(replacementLegacy);
+    });
+
     it('preserves runtime artifacts and ghost legacy state when expected primary clear is locked', () => {
       const sessionId = 'locked-primary-cleanup';
       const stateDir = join(tempDir, '.omc', 'state');
@@ -365,8 +519,7 @@ describe('mode-state-io', () => {
       writeFileSync(statePath, JSON.stringify(state));
       writeFileSync(legacyPath, JSON.stringify(state));
       writeFileSync(artifactPath, JSON.stringify({ count: 2 }));
-      const stat = readFileSync(`/proc/${process.pid}/stat`, 'utf8');
-      const processStart = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19];
+      const processStart = currentProcessStart();
       writeFileSync(`${statePath}.mutation.lock`, JSON.stringify({ version: 1, pid: process.pid, processStart, createdAt: new Date().toISOString(), nonce: randomUUID() }));
       const snapshots = [statePath, legacyPath, artifactPath].map((path) => readFileSync(path));
 
@@ -378,8 +531,7 @@ describe('mode-state-io', () => {
       const sessionId = 'in-flight-activation';
       const statePath = join(tempDir, '.omc', 'state', 'sessions', sessionId, 'autopilot-state.json');
       mkdirSync(dirname(statePath), { recursive: true });
-      const stat = readFileSync(`/proc/${process.pid}/stat`, 'utf8');
-      const processStart = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19];
+      const processStart = currentProcessStart();
       const lockPath = `${statePath}.mutation.lock`;
       writeFileSync(lockPath, JSON.stringify({ version: 1, pid: process.pid, processStart, createdAt: new Date().toISOString(), nonce: randomUUID() }));
       const childScript = String.raw`
@@ -797,7 +949,7 @@ describe('mode-state-io', () => {
       const path = join(tempDir, '.omc', 'state', 'autopilot-live-owner.json');
       const raw = JSON.stringify({ active: true, run: 'live-owner' });
       const transactionId = randomUUID();
-      const processStart = readFileSync(`/proc/${process.pid}/stat`, 'utf8').slice(readFileSync(`/proc/${process.pid}/stat`, 'utf8').lastIndexOf(')') + 2).trim().split(/\s+/)[19];
+      const processStart = currentProcessStart();
       const quarantinePath = `${path}.emergency-quarantine.${transactionId}`;
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, raw);
@@ -825,7 +977,7 @@ describe('mode-state-io', () => {
       const transformed = JSON.stringify({ active: false, run: 'pid-reused' });
       const transactionId = randomUUID();
       const quarantinePath = `${path}.emergency-quarantine.${transactionId}`;
-      const actualStart = readFileSync(`/proc/${process.pid}/stat`, 'utf8').slice(readFileSync(`/proc/${process.pid}/stat`, 'utf8').lastIndexOf(')') + 2).trim().split(/\s+/)[19];
+      const actualStart = currentProcessStart();
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, raw);
       writeFileSync(`${quarantinePath}.payload`, transformed);
@@ -845,7 +997,7 @@ describe('mode-state-io', () => {
       const raw = JSON.stringify({ active: true, run: 'unknown-owner' });
       const transactionId = randomUUID();
       const quarantinePath = `${path}.emergency-quarantine.${transactionId}`;
-      const processStart = readFileSync(`/proc/${process.pid}/stat`, 'utf8').slice(readFileSync(`/proc/${process.pid}/stat`, 'utf8').lastIndexOf(')') + 2).trim().split(/\s+/)[19];
+      const processStart = currentProcessStart();
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, raw);
       writeFileSync(`${path}.emergency-journal.json`, JSON.stringify({
@@ -858,7 +1010,7 @@ describe('mode-state-io', () => {
       expect(existsSync(`${path}.emergency-journal.json`)).toBe(true);
       expect(readFileSync(path, 'utf8')).toBe(raw);
     });
-    it('fails closed rather than reclaiming a stale recovery claim without flock', () => {
+    it('reclaims a proven stale recovery claim using SQLite without flock', () => {
       const path = join(tempDir, '.omc', 'state', 'autopilot-portable-stale-claim.json');
       const raw = JSON.stringify({ active: true, run: 'portable-stale-claim' });
       const transactionId = randomUUID();
@@ -877,9 +1029,9 @@ describe('mode-state-io', () => {
       process.env.NODE_ENV = 'test';
       process.env.OMC_TEST_FLOCK_AVAILABLE = '0';
 
-      expect(recoverEmergencyStateFile(path)).toBe(false);
-      expect(JSON.parse(readFileSync(claimPath, 'utf8'))).toEqual(staleClaim);
-      expect(readFileSync(path, 'utf8')).toBe(raw);
+      expect(recoverEmergencyStateFile(path)).toBe(true);
+      expect(existsSync(claimPath)).toBe(false);
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ active: false, run: 'portable-stale-claim' });
     });
 
     it('reclaims a stale recovery claim under the state guard and releases it for a second recovery', () => {
@@ -901,12 +1053,12 @@ describe('mode-state-io', () => {
       const claimPath = `${path}.emergency-recovery.claim`;
       writeFileSync(claimPath, JSON.stringify({ version: 1, pid: 999999999, processStart: '1', createdAt: new Date().toISOString(), nonce: randomUUID() }));
 
-      expect(recoverEmergencyStateFile(path)).toBe(true);
-      expect(existsSync(claimPath)).toBe(false);
-      writeFileSync(path, raw);
-      writeDeadJournal();
-      expect(recoverEmergencyStateFile(path)).toBe(true);
-      expect(existsSync(claimPath)).toBe(false);
+expect(recoverEmergencyStateFile(path)).toBe(true);
+expect(existsSync(claimPath)).toBe(false);
+writeFileSync(path, raw);
+writeDeadJournal();
+expect(recoverEmergencyStateFile(path)).toBe(true);
+expect(existsSync(claimPath)).toBe(false);
     });
     it('marks deterministic crash ownership abandoned before same-process recovery', () => {
       const path = join(tempDir, '.omc', 'state', 'autopilot-abandoned-owner.json');
@@ -987,8 +1139,7 @@ describe('mode-state-io', () => {
         { name: 'typescript', recover: recoverEmergencyStateFile },
         // @ts-expect-error shipped JavaScript helper intentionally has no TypeScript declaration
         { name: 'plugin', recover: (await import('../../../scripts/lib/atomic-write.mjs')).recoverEmergencyStateFile as typeof recoverEmergencyStateFile },
-        // @ts-expect-error shipped JavaScript helper intentionally has no TypeScript declaration
-        { name: 'template', recover: (await import('../../../templates/hooks/lib/atomic-write.mjs')).recoverEmergencyStateFile as typeof recoverEmergencyStateFile },
+        { name: 'template', recover: (await installedAtomicHelper()).recoverEmergencyStateFile as typeof recoverEmergencyStateFile },
       ];
       for (const { name, recover } of helpers) {
         const path = join(tempDir, '.omc', 'state', `autopilot-dead-publication-${name}.json`);
@@ -1023,10 +1174,9 @@ describe('mode-state-io', () => {
         recoverEmergencyStateFile,
         // @ts-expect-error shipped JavaScript helper intentionally has no TypeScript declaration
         (await import('../../../scripts/lib/atomic-write.mjs')).recoverEmergencyStateFile as typeof recoverEmergencyStateFile,
-        // @ts-expect-error shipped JavaScript helper intentionally has no TypeScript declaration
-        (await import('../../../templates/hooks/lib/atomic-write.mjs')).recoverEmergencyStateFile as typeof recoverEmergencyStateFile,
+        (await installedAtomicHelper()).recoverEmergencyStateFile as typeof recoverEmergencyStateFile,
       ];
-      const processStart = readFileSync(`/proc/${process.pid}/stat`, 'utf8').slice(readFileSync(`/proc/${process.pid}/stat`, 'utf8').lastIndexOf(')') + 2).trim().split(/\s+/)[19];
+      const processStart = currentProcessStart();
       for (const [index, recover] of helpers.entries()) {
         const path = join(tempDir, '.omc', 'state', `autopilot-live-publication-${index}.json`);
         const temp = `${path}.emergency-journal.json.${process.pid}.${processStart}.${randomUUID()}.tmp`;

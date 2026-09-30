@@ -147,13 +147,12 @@ function getPackedPackage(): PackedPackage {
       },
     );
     const expectedTarballName = `${packageJson.name.replace(/^@/, "").replace(/\//g, "-")}-${packageJson.version}.tgz`;
-    expect([
-      expectedTarballName,
-      `${expectedTarballName}\n`,
-      `${expectedTarballName}\r\n`,
-    ]).toContain(stdout);
-
-    const tarballName = stdout.replace(/\r?\n$/, "");
+    const tarballName = [...stdout.trim().split(/\r?\n/)]
+      .reverse()
+      .find(line => line === expectedTarballName);
+    if (tarballName === undefined) {
+      throw new Error(`npm pack did not report ${expectedTarballName}`);
+    }
     expect(tarballName).toBe(expectedTarballName);
     expect(basename(tarballName)).toBe(tarballName);
     expect(tarballName).not.toMatch(/[\\/]/);
@@ -373,9 +372,10 @@ describe("npm package bin surface regression", () => {
     expect(
       packedPackageFixture.files.has("dist/lib/worktree-paths.js"),
     ).toBe(true);
-    expect(source.match(/windowsHide/g)).toHaveLength(7);
+    expect(source.match(/windowsHide/g)).toHaveLength(8);
     expect(packedDist).not.toContain("execSync(");
-    expect(packedDist.match(/windowsHide: true/g)).toHaveLength(7);
+    expect(packedDist.match(/windowsHide: true/g)).toHaveLength(8);
+    expect(packedDist).toContain("gitTopLevelCacheMap");
   });
 
   it("packs the complete source-controlled plugin and hook payload", () => {
