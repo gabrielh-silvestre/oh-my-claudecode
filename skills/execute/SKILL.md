@@ -20,6 +20,13 @@ Take a task from agreed intent to working code, with evidence that it works.
 4. Verify as you go, not only at the end.
 5. Report what changed, what was verified, and what remains.
 
+**hexlog (fork `omc-hexlog`)**: if `.hexlog/flow.md` exists at the repo root, invoke `Skill("hexlog-flow")` for phase `execucao` at these steps; skip silently when the file is absent, and skip all of it when execute runs inside ralph, autopilot or team (they register). Target: the plan/spec basename when the task came from one; otherwise `hex:target:execute-{task-slug}`.
+- Step 3/4, per unit, once its sequence ends: one `deviation` for each non-`none` `## Deviations` an executor reported, and one `deviation` `verification-failure` with `attempts[]` in order when a unit needed a retry after a failed check (`decidedBy: executor` or `orchestrator`). hexlog-audit:RG-4 hexlog-audit:RG-6
+- Step 5, before reporting: `timeline` of the target must show every deviation above. `timeline` is paginated (limit 50, `nextCursor`): page with `since` = `nextCursor` until it is null before treating anything as missing. Register any gap now, saying in `source` that it is late. hexlog-audit:RG-9
+- Step 5: milestone `phase-completed`. Do not register `completion-verified`: approval is recorded by `review` (gate `review-approved`) or `verify` (gate `verified`).
+- User cancel: milestone `cancelled`. A stop that needs the user: milestone `escalated`. Register a `deviation` at the same moment with the reason and what was tried (`outcome.status: user-stop`, `decidedBy: user`). hexlog-audit:RG-8
+- General rule: load `references/audit-types.md` of the `hexlog-flow` skill before recording an audit type. hexlog-audit:RG-10
+
 ## Scale
 Match the machinery to the task:
 - **Single unit** — implement directly, verify, done.

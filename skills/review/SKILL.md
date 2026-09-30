@@ -20,6 +20,7 @@ Find what is actually wrong, ranked by severity, with enough detail to act on.
 3. Check correctness first, then risk, then simplification.
 4. Verify each candidate finding before reporting it.
 5. Report findings most-severe first.
+6. **hexlog (fork `omc-hexlog`)**: if `.hexlog/flow.md` exists at the repo root, invoke `Skill("hexlog-flow")` for phase `revisao`, target: the plan/spec basename of the reviewed change when known, otherwise `hex:target:review-{change-slug}`. `attachment({project, text})` of the full review report, verbatim; then verdict `review` = `approve` (no blocking finding) | `request-changes` (blocking findings to fix) | `reject` (evidence: that hash and the top findings, file:line); then evaluate the phase gate `review-approved`. A re-review after fixes supersedes the previous `review` verdict. The gate records the outcome only; review stays advisory. Skip silently when the file is absent.
 
 ## What to check
 - **Correctness** — logic defects, edge cases, error paths, concurrency
